@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+data.sqlite3
+server.out.log
+server.err.log
+browser_sessions/

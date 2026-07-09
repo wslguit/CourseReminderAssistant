@@ -1,0 +1,1201 @@
+import os
+import sqlite3
+from datetime import datetime
+import tkinter as tk
+from tkinter import messagebox, ttk
+
+from app_info import APP_NAME, APP_VERSION
+from app_paths import database_path
+from platform_api import (
+    ScraperError,
+    crawl_assignment_tasks,
+    crawl_platform_courses,
+    supported_assignment_platforms,
+    supported_platforms,
+)
+
+
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+DATABASE = database_path()
+DEFAULT_PLATFORM = "学习通"
+PLATFORM_DEFAULTS = {
+    "学习通": {
+        "api_method": "POST",
+        "api_url": "https://mooc2-ans.chaoxing.com/mooc2-ans/visit/courselistdata",
+        "api_body": "courseType=1&courseFolderId=0&query=&pageHeader=-1&single=0&superstarClass=0&isFirefly=0",
+    },
+    "中国大学 MOOC": {
+        "api_method": "POST",
+        "api_url": "https://www.icourse163.org/web/j/learnerCourseRpcBean.getMyLearnedCoursePanelList.rpc?csrfKey=",
+        "api_body": "type=30&p=1&psize=8&courseType=2",
+    },
+    "智慧树": {
+        "api_method": "POST",
+        "api_url": "https://onlineservice-api.zhihuishu.com/gateway/t/v1/student/course/share/queryShareCourseInfo",
+        "api_body": "secretStr=&date=",
+    },
+}
+ASSIGNMENT_PLATFORM_DEFAULTS = {
+    "学校作业平台": {
+        "api_method": "GET",
+        "api_url": "https://v.guet.edu.cn/https/77726476706e69737468656265737421f3f8548e34357b1e791d8cb8d6502720ee3b03/ntf/users/115611/notifications?vpn-12-o2-courses.guet.edu.cn&limit=5&additionalFields=total_count&removed=only_mobile",
+        "api_body": "",
+    }
+}
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
+
+
+def now_text():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def connect_db():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ensure_column(conn, table, column, column_type):
+    columns = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
+def init_db():
+    with connect_db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS platform_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                platform_name TEXT NOT NULL,
+                platform_username TEXT,
+                platform_password TEXT,
+                status TEXT NOT NULL DEFAULT '未绑定',
+                last_sync_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, platform_name),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS courses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                platform_name TEXT NOT NULL,
+                course_name TEXT NOT NULL,
+                course_url TEXT,
+                teacher TEXT,
+                progress INTEGER NOT NULL DEFAULT 0,
+                deadline_time TEXT,
+                exam_time TEXT,
+                status TEXT NOT NULL DEFAULT '未完成',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, platform_name, course_name),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                user_id INTEGER NOT NULL,
+                setting_key TEXT NOT NULL,
+                setting_value TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, setting_key),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS assignment_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                platform_name TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                course_name TEXT NOT NULL,
+                task_title TEXT NOT NULL,
+                task_url TEXT,
+                publish_time TEXT,
+                deadline_time TEXT,
+                status TEXT NOT NULL DEFAULT '进行中',
+                external_id TEXT NOT NULL,
+                raw_text TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, platform_name, external_id),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """
+        )
+        for column in (
+            "auth_cookie",
+            "api_url",
+            "referer",
+            "user_agent",
+            "api_method",
+            "api_body",
+            "last_sync_at",
+        ):
+            ensure_column(conn, "platform_accounts", column, "TEXT")
+        conn.commit()
+
+
+def get_desktop_user_id():
+    with connect_db() as conn:
+        row = conn.execute("SELECT id FROM users WHERE username = ?", ("desktop",)).fetchone()
+        if row:
+            return row["id"]
+        cursor = conn.execute(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            ("desktop", "desktop-local-user", now_text()),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def parse_time(value):
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def get_setting(user_id, key, default=""):
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT setting_value FROM app_settings WHERE user_id = ? AND setting_key = ?",
+            (user_id, key),
+        ).fetchone()
+    return row["setting_value"] if row else default
+
+
+def set_setting(user_id, key, value):
+    with connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO app_settings (user_id, setting_key, setting_value, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, setting_key) DO UPDATE SET
+                setting_value = excluded.setting_value,
+                updated_at = excluded.updated_at
+            """,
+            (user_id, key, str(value), now_text()),
+        )
+        conn.commit()
+
+
+def load_reminder_days(user_id):
+    try:
+        value = int(get_setting(user_id, "reminder_days", "7"))
+    except ValueError:
+        value = 7
+    return min(30, max(1, value))
+
+
+def nearest_time_sort_key(row, fields):
+    now = datetime.now()
+    future_times = []
+    past_times = []
+    for field in fields:
+        try:
+            value = row[field]
+        except (KeyError, IndexError):
+            value = None
+        parsed = parse_time(value)
+        if not parsed:
+            continue
+        if parsed >= now:
+            future_times.append(parsed)
+        else:
+            past_times.append(parsed)
+    if future_times:
+        nearest = min(future_times)
+        return (0, (nearest - now).total_seconds())
+    if past_times:
+        nearest = max(past_times)
+        return (1, (now - nearest).total_seconds())
+    return (2, float("inf"))
+
+
+def reminder_state(target_time, reminder_days):
+    if not target_time:
+        return None
+    now = datetime.now()
+    seconds_left = (target_time - now).total_seconds()
+    if seconds_left < 0:
+        return {
+            "state": "expired",
+            "seconds_left": seconds_left,
+            "days_left": 0,
+        }
+    remind_seconds = max(1, reminder_days) * 24 * 60 * 60
+    if seconds_left <= remind_seconds:
+        return {
+            "state": "soon",
+            "seconds_left": seconds_left,
+            "days_left": int(seconds_left // (24 * 60 * 60)),
+        }
+    return None
+
+
+def calculated_status(primary_time, reminder_days, soon_label):
+    state = reminder_state(primary_time, reminder_days)
+    if not primary_time:
+        return "暂无时间"
+    if not state:
+        return "未到提醒"
+    if state["state"] == "expired":
+        return "已逾期"
+    return soon_label
+
+
+def calculated_course_status(row, reminder_days):
+    deadline = parse_time(row["deadline_time"])
+    if deadline:
+        return calculated_status(deadline, reminder_days, "即将截止")
+    exam_time = parse_time(row["exam_time"])
+    if exam_time:
+        return calculated_status(exam_time, reminder_days, "即将考试")
+    return "暂无时间"
+
+
+def calculated_assignment_status(row, reminder_days):
+    deadline = parse_time(row["deadline_time"])
+    return calculated_status(deadline, reminder_days, "即将截止")
+
+
+def platform_default(platform_name, key):
+    defaults = PLATFORM_DEFAULTS.get(platform_name, PLATFORM_DEFAULTS[DEFAULT_PLATFORM])
+    if key == "user_agent":
+        return DEFAULT_USER_AGENT
+    return defaults.get(key, "")
+
+
+def assignment_platform_default(platform_name, key):
+    defaults = ASSIGNMENT_PLATFORM_DEFAULTS.get(platform_name, ASSIGNMENT_PLATFORM_DEFAULTS["学校作业平台"])
+    if key == "user_agent":
+        return DEFAULT_USER_AGENT
+    return defaults.get(key, "")
+
+
+class MiniReminderApp:
+    def __init__(self, root):
+        init_db()
+        self.root = root
+        self.user_id = get_desktop_user_id()
+        self.reminder_days = tk.IntVar(value=load_reminder_days(self.user_id))
+        self._drag_start = None
+
+        self.root.title(f"{APP_NAME} v{APP_VERSION}")
+        self.root.geometry(self._bottom_right_geometry(430, 240))
+        self.root.minsize(390, 220)
+        self.root.configure(bg="#eef4ff")
+        self.root.attributes("-topmost", True)
+        self.root.resizable(False, False)
+
+        self._build_mini_window()
+        self.root.after(800, self.show_startup_reminders)
+
+    def _bottom_right_geometry(self, width, height):
+        self.root.update_idletasks()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = max(20, screen_width - width - 70)
+        y = max(20, screen_height - height - 100)
+        return f"{width}x{height}+{x}+{y}"
+
+    def _build_mini_window(self):
+        outer = tk.Frame(self.root, bg="#eef4ff", padx=8, pady=8)
+        outer.pack(fill="both", expand=True)
+        outer.bind("<ButtonPress-1>", self._start_drag)
+        outer.bind("<B1-Motion>", self._drag_window)
+
+        close_btn = tk.Button(
+            outer,
+            text="×",
+            command=self.root.destroy,
+            bd=0,
+            bg="#eef4ff",
+            fg="#7c8aa6",
+            activebackground="#e4ecfb",
+            font=("Microsoft YaHei UI", 14, "bold"),
+            cursor="hand2",
+        )
+        close_btn.place(x=392, y=0, width=28, height=28)
+
+        card = tk.Frame(outer, bg="white", highlightbackground="#d7e2f5", highlightthickness=1)
+        card.place(x=12, y=28, width=235, height=176)
+
+        tk.Label(
+            card,
+            text=f"网课提醒助手 v{APP_VERSION}",
+            bg="white",
+            fg="#65738f",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(side="bottom", pady=(0, 8))
+
+        grid = tk.Frame(card, bg="white")
+        grid.pack(fill="both", expand=True, padx=12, pady=(12, 2))
+
+        self._tool_button(grid, "📋", "任务列表", self.open_task_list, 0, 0, "#4f8cff")
+        self._tool_button(grid, "☁", "读取课程", self.open_sync_settings, 0, 1, "#7b6dff")
+        self._tool_button(grid, "📝", "读取作业", self.open_assignment_sync_settings, 1, 0, "#f2b84b")
+        self._tool_button(grid, "⏳", "即将截止", self.show_reminders, 1, 1, "#ee8f93")
+
+        mascot = tk.Canvas(outer, width=150, height=170, bg="#eef4ff", highlightthickness=0)
+        mascot.place(x=260, y=48)
+        self._draw_mascot(mascot)
+        mascot.bind("<Button-1>", lambda _event: self.show_reminders())
+        mascot.bind("<ButtonPress-1>", self._start_drag)
+        mascot.bind("<B1-Motion>", self._drag_window)
+
+        tip_count = len(self.build_reminders())
+        tip_text = f"{tip_count} 个临期提醒" if tip_count else "暂无临期任务"
+        self.tip_var = tk.StringVar(value=tip_text)
+        tk.Label(
+            outer,
+            textvariable=self.tip_var,
+            bg="#eef4ff",
+            fg="#53647f",
+            font=("Microsoft YaHei UI", 10),
+        ).place(x=262, y=16, width=130, height=24)
+
+    def _tool_button(self, parent, icon, text, command, row, column, color):
+        button = tk.Button(
+            parent,
+            text=f"{icon}\n{text}",
+            command=command,
+            bd=0,
+            relief="flat",
+            bg="#f5f7fe",
+            activebackground="#edf2ff",
+            fg="#1c2740",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            cursor="hand2",
+        )
+        button.grid(row=row, column=column, sticky="nsew", padx=5, pady=5)
+        parent.grid_columnconfigure(column, weight=1)
+        parent.grid_rowconfigure(row, weight=1)
+        button.configure(highlightthickness=1, highlightbackground=color)
+
+    def _draw_mascot(self, canvas):
+        canvas.create_oval(46, 108, 130, 132, fill="#d9e8ff", outline="")
+        canvas.create_oval(32, 32, 118, 118, fill="#f7fbff", outline="#b8c9ea", width=2)
+        canvas.create_oval(48, 58, 64, 74, fill="#2b364d", outline="")
+        canvas.create_oval(88, 58, 104, 74, fill="#2b364d", outline="")
+        canvas.create_arc(60, 72, 94, 96, start=205, extent=130, style="arc", width=2, outline="#f08ca0")
+        canvas.create_polygon(36, 40, 14, 18, 50, 28, fill="#e9f2ff", outline="#b8c9ea")
+        canvas.create_polygon(106, 28, 142, 18, 118, 40, fill="#e9f2ff", outline="#b8c9ea")
+        canvas.create_text(75, 23, text="课", fill="#4f8cff", font=("Microsoft YaHei UI", 16, "bold"))
+        canvas.create_text(75, 144, text="点我查看提醒", fill="#5b6882", font=("Microsoft YaHei UI", 9))
+
+    def _start_drag(self, event):
+        self._drag_start = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
+
+    def _drag_window(self, event):
+        if not self._drag_start:
+            return
+        start_x, start_y, win_x, win_y = self._drag_start
+        dx = event.x_root - start_x
+        dy = event.y_root - start_y
+        self.root.geometry(f"+{win_x + dx}+{win_y + dy}")
+
+    def get_account_config(self, platform_name=DEFAULT_PLATFORM):
+        with connect_db() as conn:
+            account = conn.execute(
+                "SELECT * FROM platform_accounts WHERE user_id = ? AND platform_name = ?",
+                (self.user_id, platform_name),
+            ).fetchone()
+        if not account:
+            return None
+        return {
+            "api_method": account["api_method"] or "POST",
+            "api_url": account["api_url"] or platform_default(platform_name, "api_url"),
+            "auth_cookie": account["auth_cookie"] or "",
+            "api_body": account["api_body"] or platform_default(platform_name, "api_body"),
+            "referer": account["referer"] or "",
+            "user_agent": account["user_agent"] or DEFAULT_USER_AGENT,
+        }
+
+    def get_assignment_account_config(self, platform_name="学校作业平台"):
+        with connect_db() as conn:
+            account = conn.execute(
+                "SELECT * FROM platform_accounts WHERE user_id = ? AND platform_name = ?",
+                (self.user_id, platform_name),
+            ).fetchone()
+        if not account:
+            return None
+        return {
+            "api_method": account["api_method"] or "GET",
+            "api_url": account["api_url"] or assignment_platform_default(platform_name, "api_url"),
+            "auth_cookie": account["auth_cookie"] or "",
+            "api_body": account["api_body"] or assignment_platform_default(platform_name, "api_body"),
+            "referer": account["referer"] or "",
+            "user_agent": account["user_agent"] or DEFAULT_USER_AGENT,
+        }
+
+    def save_account(self, window, fields):
+        platform_name = fields["platform"].get().strip() or DEFAULT_PLATFORM
+        config = {
+            "api_method": fields["method"].get().strip() or "POST",
+            "api_url": fields["api_url"].get().strip(),
+            "auth_cookie": fields["cookie"].get("1.0", "end").strip(),
+            "api_body": fields["body"].get("1.0", "end").strip(),
+            "referer": fields["referer"].get().strip(),
+            "user_agent": fields["user_agent"].get().strip() or DEFAULT_USER_AGENT,
+        }
+        if not config["api_url"]:
+            messagebox.showwarning("缺少接口 URL", f"请先填写{platform_name}课程接口 URL。", parent=window)
+            return False
+        if not config["auth_cookie"]:
+            messagebox.showwarning("缺少 Cookie", f"请先填写从{platform_name}请求 Headers 里复制出来的 Cookie。", parent=window)
+            return False
+        if platform_name == "中国大学 MOOC" and "csrfKey=" not in config["api_url"] and "NTESSTUDYSI=" not in config["auth_cookie"]:
+            messagebox.showwarning(
+                "缺少 csrfKey",
+                "中国大学 MOOC 需要接口 URL 包含 csrfKey，或 Cookie 中包含 NTESSTUDYSI。",
+                parent=window,
+            )
+            return False
+
+        timestamp = now_text()
+        with connect_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO platform_accounts
+                    (user_id, platform_name, status, auth_cookie, api_url, referer,
+                     user_agent, api_method, api_body, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, platform_name) DO UPDATE SET
+                    status = excluded.status,
+                    auth_cookie = excluded.auth_cookie,
+                    api_url = excluded.api_url,
+                    referer = excluded.referer,
+                    user_agent = excluded.user_agent,
+                    api_method = excluded.api_method,
+                    api_body = excluded.api_body,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    self.user_id,
+                    platform_name,
+                    "已绑定",
+                    config["auth_cookie"],
+                    config["api_url"],
+                    config["referer"],
+                    config["user_agent"],
+                    config["api_method"],
+                    config["api_body"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            conn.commit()
+        messagebox.showinfo("保存成功", f"{platform_name}接口信息已保存。", parent=window)
+        return True
+
+    def save_assignment_account(self, window, fields):
+        platform_name = fields["platform"].get().strip() or "学校作业平台"
+        config = {
+            "api_method": fields["method"].get().strip() or "GET",
+            "api_url": fields["api_url"].get().strip(),
+            "auth_cookie": fields["cookie"].get("1.0", "end").strip(),
+            "api_body": fields["body"].get("1.0", "end").strip(),
+            "referer": fields["referer"].get().strip(),
+            "user_agent": fields["user_agent"].get().strip() or DEFAULT_USER_AGENT,
+        }
+        if not config["api_url"]:
+            messagebox.showwarning("缺少接口 URL", "请先填写学校作业通知接口 URL。", parent=window)
+            return False
+        if not config["auth_cookie"]:
+            messagebox.showwarning("缺少 Cookie", "请先填写从学校作业平台请求 Headers 里复制出来的 Cookie。", parent=window)
+            return False
+
+        timestamp = now_text()
+        with connect_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO platform_accounts
+                    (user_id, platform_name, status, auth_cookie, api_url, referer,
+                     user_agent, api_method, api_body, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, platform_name) DO UPDATE SET
+                    status = excluded.status,
+                    auth_cookie = excluded.auth_cookie,
+                    api_url = excluded.api_url,
+                    referer = excluded.referer,
+                    user_agent = excluded.user_agent,
+                    api_method = excluded.api_method,
+                    api_body = excluded.api_body,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    self.user_id,
+                    platform_name,
+                    "已绑定",
+                    config["auth_cookie"],
+                    config["api_url"],
+                    config["referer"],
+                    config["user_agent"],
+                    config["api_method"],
+                    config["api_body"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            conn.commit()
+        messagebox.showinfo("保存成功", f"{platform_name}接口信息已保存。", parent=window)
+        return True
+
+    def open_sync_settings(self):
+        window = tk.Toplevel(self.root)
+        window.title("读取课程设置")
+        window.geometry("660x610")
+        window.configure(bg="#f6f8fe")
+        window.transient(self.root)
+
+        platform_var = tk.StringVar(value=DEFAULT_PLATFORM)
+        account = self.get_account_config(platform_var.get()) or {}
+        fields = {
+            "platform": platform_var,
+            "method": tk.StringVar(value=account.get("api_method", platform_default(platform_var.get(), "api_method"))),
+            "api_url": tk.StringVar(value=account.get("api_url", platform_default(platform_var.get(), "api_url"))),
+            "referer": tk.StringVar(value=account.get("referer", "")),
+            "user_agent": tk.StringVar(value=account.get("user_agent", DEFAULT_USER_AGENT)),
+        }
+
+        frame = ttk.Frame(window, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        def load_selected_platform(*_args):
+            platform_name = fields["platform"].get()
+            selected_account = self.get_account_config(platform_name) or {}
+            fields["method"].set(selected_account.get("api_method", platform_default(platform_name, "api_method")))
+            fields["api_url"].set(selected_account.get("api_url", platform_default(platform_name, "api_url")))
+            fields["referer"].set(selected_account.get("referer", ""))
+            fields["user_agent"].set(selected_account.get("user_agent", DEFAULT_USER_AGENT))
+            if "cookie" in fields:
+                fields["cookie"].delete("1.0", "end")
+                fields["cookie"].insert("1.0", selected_account.get("auth_cookie", ""))
+            if "body" in fields:
+                fields["body"].delete("1.0", "end")
+                fields["body"].insert("1.0", selected_account.get("api_body", platform_default(platform_name, "api_body")))
+
+        ttk.Label(frame, text="平台").pack(anchor="w")
+        platform_box = ttk.Combobox(
+            frame,
+            textvariable=fields["platform"],
+            values=supported_platforms(),
+            state="readonly",
+        )
+        platform_box.pack(fill="x", pady=(4, 10))
+        platform_box.bind("<<ComboboxSelected>>", load_selected_platform)
+
+        ttk.Label(frame, text="请求方式").pack(anchor="w")
+        ttk.Combobox(frame, textvariable=fields["method"], values=("POST", "GET"), state="readonly").pack(
+            fill="x", pady=(4, 10)
+        )
+
+        ttk.Label(frame, text="课程接口 URL").pack(anchor="w")
+        ttk.Entry(frame, textvariable=fields["api_url"]).pack(fill="x", pady=(4, 10))
+
+        ttk.Label(frame, text="Cookie").pack(anchor="w")
+        cookie_text = tk.Text(frame, height=7, wrap="word")
+        cookie_text.pack(fill="both", expand=True, pady=(4, 10))
+        cookie_text.insert("1.0", account.get("auth_cookie", ""))
+        fields["cookie"] = cookie_text
+
+        ttk.Label(frame, text="请求体参数").pack(anchor="w")
+        body_text = tk.Text(frame, height=4, wrap="word")
+        body_text.pack(fill="x", pady=(4, 10))
+        body_text.insert("1.0", account.get("api_body", platform_default(platform_var.get(), "api_body")))
+        fields["body"] = body_text
+
+        ttk.Label(frame, text="Referer").pack(anchor="w")
+        ttk.Entry(frame, textvariable=fields["referer"]).pack(fill="x", pady=(4, 10))
+
+        ttk.Label(frame, text="User-Agent").pack(anchor="w")
+        ttk.Entry(frame, textvariable=fields["user_agent"]).pack(fill="x", pady=(4, 12))
+
+        actions = ttk.Frame(frame)
+        actions.pack(fill="x")
+        ttk.Button(actions, text="保存", command=lambda: self.save_account(window, fields)).pack(
+            side="left", padx=(0, 8)
+        )
+        ttk.Button(actions, text="保存并读取课程", command=lambda: self.sync_courses(window, fields)).pack(side="left")
+
+    def open_assignment_sync_settings(self):
+        window = tk.Toplevel(self.root)
+        window.title("读取作业设置")
+        window.geometry("660x610")
+        window.configure(bg="#f6f8fe")
+        window.transient(self.root)
+
+        platform_var = tk.StringVar(value="学校作业平台")
+        account = self.get_assignment_account_config(platform_var.get()) or {}
+        fields = {
+            "platform": platform_var,
+            "method": tk.StringVar(value=account.get("api_method", assignment_platform_default(platform_var.get(), "api_method"))),
+            "api_url": tk.StringVar(value=account.get("api_url", assignment_platform_default(platform_var.get(), "api_url"))),
+            "referer": tk.StringVar(value=account.get("referer", "")),
+            "user_agent": tk.StringVar(value=account.get("user_agent", DEFAULT_USER_AGENT)),
+        }
+
+        frame = ttk.Frame(window, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="作业平台").pack(anchor="w")
+        ttk.Combobox(
+            frame,
+            textvariable=fields["platform"],
+            values=supported_assignment_platforms(),
+            state="readonly",
+        ).pack(fill="x", pady=(4, 10))
+
+        ttk.Label(frame, text="请求方式").pack(anchor="w")
+        ttk.Combobox(frame, textvariable=fields["method"], values=("GET", "POST"), state="readonly").pack(
+            fill="x", pady=(4, 10)
+        )
+
+        ttk.Label(frame, text="作业通知接口 URL").pack(anchor="w")
+        ttk.Entry(frame, textvariable=fields["api_url"]).pack(fill="x", pady=(4, 10))
+
+        ttk.Label(frame, text="Cookie").pack(anchor="w")
+        cookie_text = tk.Text(frame, height=7, wrap="word")
+        cookie_text.pack(fill="both", expand=True, pady=(4, 10))
+        cookie_text.insert("1.0", account.get("auth_cookie", ""))
+        fields["cookie"] = cookie_text
+
+        ttk.Label(frame, text="请求体参数（GET 可留空）").pack(anchor="w")
+        body_text = tk.Text(frame, height=4, wrap="word")
+        body_text.pack(fill="x", pady=(4, 10))
+        body_text.insert("1.0", account.get("api_body", assignment_platform_default(platform_var.get(), "api_body")))
+        fields["body"] = body_text
+
+        ttk.Label(frame, text="Referer").pack(anchor="w")
+        ttk.Entry(frame, textvariable=fields["referer"]).pack(fill="x", pady=(4, 10))
+
+        ttk.Label(frame, text="User-Agent").pack(anchor="w")
+        ttk.Entry(frame, textvariable=fields["user_agent"]).pack(fill="x", pady=(4, 12))
+
+        actions = ttk.Frame(frame)
+        actions.pack(fill="x")
+        ttk.Button(actions, text="保存", command=lambda: self.save_assignment_account(window, fields)).pack(
+            side="left", padx=(0, 8)
+        )
+        ttk.Button(actions, text="保存并读取作业", command=lambda: self.sync_assignments(window, fields)).pack(side="left")
+
+    def sync_courses(self, window=None, fields=None):
+        if fields and not self.save_account(window, fields):
+            return
+        platform_name = fields["platform"].get().strip() if fields else DEFAULT_PLATFORM
+        config = self.get_account_config(platform_name)
+        if not config or not config["auth_cookie"]:
+            self.open_sync_settings()
+            return
+
+        try:
+            courses = crawl_platform_courses(platform_name, config)
+        except ScraperError as exc:
+            messagebox.showerror("同步失败", str(exc), parent=window or self.root)
+            if messagebox.askyesno("重新填写", "是否打开课程同步设置，重新填写 Cookie 或接口信息？", parent=window or self.root):
+                self.open_sync_settings()
+            return
+        except Exception as exc:
+            messagebox.showerror("同步失败", f"发生未知错误：{exc}", parent=window or self.root)
+            return
+
+        courses = self.dedupe_fetched_courses(courses)
+        timestamp = now_text()
+        with connect_db() as conn:
+            for item in courses:
+                conn.execute(
+                    """
+                    INSERT INTO courses
+                        (user_id, platform_name, course_name, course_url, teacher, progress,
+                         deadline_time, exam_time, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, platform_name, course_name) DO UPDATE SET
+                        course_url = excluded.course_url,
+                        teacher = excluded.teacher,
+                        progress = excluded.progress,
+                        deadline_time = excluded.deadline_time,
+                        exam_time = excluded.exam_time,
+                        status = excluded.status,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        self.user_id,
+                        platform_name,
+                        item.get("course_name") or "未命名课程",
+                        item.get("course_url") or "",
+                        item.get("teacher") or "",
+                        int(item.get("progress") or 0),
+                        item.get("deadline_time"),
+                        item.get("exam_time"),
+                        item.get("status") or "进行中",
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE platform_accounts
+                SET status = ?, last_sync_at = ?, updated_at = ?
+                WHERE user_id = ? AND platform_name = ?
+                """,
+                ("已获取课程", timestamp, timestamp, self.user_id, platform_name),
+            )
+            self.cleanup_duplicate_courses(conn, platform_name)
+            conn.commit()
+
+        self.refresh_tip()
+        messagebox.showinfo("同步完成", f"已读取并保存 {len(courses)} 门{platform_name}课程。", parent=window or self.root)
+
+    def sync_assignments(self, window=None, fields=None):
+        if fields and not self.save_assignment_account(window, fields):
+            return
+        platform_name = fields["platform"].get().strip() if fields else "学校作业平台"
+        config = self.get_assignment_account_config(platform_name)
+        if not config or not config["auth_cookie"]:
+            self.open_assignment_sync_settings()
+            return
+
+        try:
+            tasks = crawl_assignment_tasks(platform_name, config)
+        except ScraperError as exc:
+            messagebox.showerror("读取作业失败", str(exc), parent=window or self.root)
+            if messagebox.askyesno("重新填写", "是否打开读取作业设置，重新填写 Cookie 或接口信息？", parent=window or self.root):
+                self.open_assignment_sync_settings()
+            return
+        except Exception as exc:
+            messagebox.showerror("读取作业失败", f"发生未知错误：{exc}", parent=window or self.root)
+            return
+
+        timestamp = now_text()
+        with connect_db() as conn:
+            self.mark_expired_assignments(conn, platform_name)
+            for item in tasks:
+                conn.execute(
+                    """
+                    INSERT INTO assignment_tasks
+                        (user_id, platform_name, task_type, course_name, task_title, task_url,
+                         publish_time, deadline_time, status, external_id, raw_text, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, platform_name, external_id) DO UPDATE SET
+                        task_type = excluded.task_type,
+                        course_name = excluded.course_name,
+                        task_title = excluded.task_title,
+                        task_url = excluded.task_url,
+                        publish_time = excluded.publish_time,
+                        deadline_time = excluded.deadline_time,
+                        status = excluded.status,
+                        raw_text = excluded.raw_text,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        self.user_id,
+                        platform_name,
+                        item.get("task_type") or "作业",
+                        item.get("course_name") or "未知课程",
+                        item.get("task_title") or "未命名任务",
+                        item.get("task_url") or "",
+                        item.get("publish_time"),
+                        item.get("deadline_time"),
+                        item.get("status") or "进行中",
+                        item.get("external_id"),
+                        item.get("raw_text") or "",
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE platform_accounts
+                SET status = ?, last_sync_at = ?, updated_at = ?
+                WHERE user_id = ? AND platform_name = ?
+                """,
+                ("已获取作业", timestamp, timestamp, self.user_id, platform_name),
+            )
+            conn.commit()
+
+        self.refresh_tip()
+        messagebox.showinfo("读取完成", f"已读取并保存 {len(tasks)} 条{platform_name}作业/测试任务。", parent=window or self.root)
+
+    def mark_expired_assignments(self, conn, platform_name=None):
+        now = now_text()
+        if platform_name:
+            conn.execute(
+                """
+                UPDATE assignment_tasks
+                SET status = ?, updated_at = ?
+                WHERE user_id = ?
+                  AND platform_name = ?
+                  AND deadline_time IS NOT NULL
+                  AND deadline_time < ?
+                  AND status != ?
+                """,
+                ("已截止", now, self.user_id, platform_name, now, "已截止"),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE assignment_tasks
+                SET status = ?, updated_at = ?
+                WHERE user_id = ?
+                  AND deadline_time IS NOT NULL
+                  AND deadline_time < ?
+                  AND status != ?
+                """,
+                ("已截止", now, self.user_id, now, "已截止"),
+            )
+
+    def dedupe_fetched_courses(self, courses):
+        best = {}
+        for item in courses:
+            name = item.get("course_name") or "未命名课程"
+            key = self.course_name_key(name)
+            old = best.get(key)
+            if old is None or self.course_quality_score(item) > self.course_quality_score(old):
+                best[key] = item
+        return list(best.values())
+
+    def cleanup_duplicate_courses(self, conn, platform_name):
+        rows = conn.execute(
+            """
+            SELECT * FROM courses
+            WHERE user_id = ? AND platform_name = ?
+            ORDER BY id ASC
+            """,
+            (self.user_id, platform_name),
+        ).fetchall()
+        groups = {}
+        for row in rows:
+            groups.setdefault(self.course_name_key(row["course_name"]), []).append(row)
+
+        for group in groups.values():
+            if len(group) <= 1:
+                continue
+            keep = max(group, key=self.stored_course_quality_score)
+            delete_ids = [row["id"] for row in group if row["id"] != keep["id"]]
+            placeholders = ",".join("?" for _ in delete_ids)
+            conn.execute(
+                f"DELETE FROM courses WHERE user_id = ? AND platform_name = ? AND id IN ({placeholders})",
+                [self.user_id, platform_name, *delete_ids],
+            )
+
+    def course_name_key(self, name):
+        return "".join(str(name or "").split()).lower()
+
+    def course_quality_score(self, item):
+        return (
+            (10 if item.get("deadline_time") else 0)
+            + (5 if item.get("teacher") else 0)
+            + (2 if item.get("course_url") else 0)
+            + (1 if item.get("status") == "已结束" else 0)
+        )
+
+    def stored_course_quality_score(self, row):
+        return (
+            (10 if row["deadline_time"] else 0)
+            + (5 if row["teacher"] else 0)
+            + (2 if row["course_url"] else 0)
+            + (1 if row["status"] == "已结束" else 0)
+            + row["id"] * 0.000001
+        )
+
+    def open_task_list(self):
+        with connect_db() as conn:
+            self.mark_expired_assignments(conn)
+            conn.commit()
+
+        window = tk.Toplevel(self.root)
+        window.title("任务列表")
+        window.geometry("900x620")
+        window.configure(bg="#f6f8fe")
+        window.transient(self.root)
+
+        toolbar = ttk.Frame(window, padding=(12, 12, 12, 4))
+        toolbar.pack(fill="x")
+        ttk.Button(toolbar, text="读取课程", command=self.open_sync_settings).pack(side="left", padx=(0, 8))
+        ttk.Button(toolbar, text="读取作业", command=self.open_assignment_sync_settings).pack(side="left", padx=(0, 8))
+        ttk.Button(toolbar, text="提醒设置", command=self.open_reminder_settings).pack(side="left", padx=(0, 8))
+
+        notebook = ttk.Notebook(window)
+        notebook.pack(fill="both", expand=True, padx=12, pady=12)
+
+        course_frame = ttk.Frame(notebook, padding=8)
+        assignment_frame = ttk.Frame(notebook, padding=8)
+        notebook.add(course_frame, text="课程任务")
+        notebook.add(assignment_frame, text="作业任务")
+
+        course_actions = ttk.Frame(course_frame)
+        course_actions.pack(fill="x", pady=(0, 8))
+        ttk.Button(course_actions, text="删除选中课程", command=lambda: self.delete_selected_courses(course_tree, window)).pack(
+            side="left"
+        )
+
+        course_columns = ("platform_name", "course_name", "teacher", "deadline_time", "exam_time", "status")
+        course_tree = ttk.Treeview(course_frame, columns=course_columns, show="headings", selectmode="extended")
+        course_tree.pack(fill="both", expand=True)
+        course_headings = {
+            "course_name": "课程",
+            "platform_name": "平台",
+            "teacher": "教师/信息",
+            "deadline_time": "截止",
+            "exam_time": "考试",
+            "status": "状态",
+        }
+        course_widths = {"platform_name": 110, "course_name": 230, "teacher": 140, "deadline_time": 140, "exam_time": 140, "status": 80}
+        for column in course_columns:
+            course_tree.heading(column, text=course_headings[column])
+            course_tree.column(column, width=course_widths[column], anchor="w")
+        self.fill_course_tree(course_tree)
+
+        assignment_actions = ttk.Frame(assignment_frame)
+        assignment_actions.pack(fill="x", pady=(0, 8))
+        ttk.Button(
+            assignment_actions,
+            text="删除选中作业",
+            command=lambda: self.delete_selected_assignments(assignment_tree, window),
+        ).pack(side="left")
+
+        assignment_columns = ("platform_name", "course_name", "task_type", "task_title", "deadline_time", "status")
+        assignment_tree = ttk.Treeview(assignment_frame, columns=assignment_columns, show="headings", selectmode="extended")
+        assignment_tree.pack(fill="both", expand=True)
+        assignment_headings = {
+            "platform_name": "平台",
+            "course_name": "课程",
+            "task_type": "类型",
+            "task_title": "作业/测试",
+            "deadline_time": "截止",
+            "status": "状态",
+        }
+        assignment_widths = {
+            "platform_name": 120,
+            "course_name": 190,
+            "task_type": 80,
+            "task_title": 250,
+            "deadline_time": 150,
+            "status": 80,
+        }
+        for column in assignment_columns:
+            assignment_tree.heading(column, text=assignment_headings[column])
+            assignment_tree.column(column, width=assignment_widths[column], anchor="w")
+        self.fill_assignment_tree(assignment_tree)
+
+    def fill_course_tree(self, tree):
+        for item_id in tree.get_children():
+            tree.delete(item_id)
+        with connect_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM courses
+                WHERE user_id = ?
+                ORDER BY updated_at DESC
+                """,
+                (self.user_id,),
+            ).fetchall()
+        rows = sorted(rows, key=lambda row: nearest_time_sort_key(row, ("deadline_time", "exam_time")))
+        reminder_days = max(1, self.reminder_days.get())
+        for row in rows:
+            tree.insert(
+                "",
+                "end",
+                iid=str(row["id"]),
+                values=(
+                    row["platform_name"],
+                    row["course_name"],
+                    row["teacher"] or "暂无",
+                    row["deadline_time"] or "暂无",
+                    row["exam_time"] or "暂无",
+                    calculated_course_status(row, reminder_days),
+                ),
+            )
+
+    def delete_selected_courses(self, tree, window):
+        selected = tree.selection()
+        if not selected:
+            messagebox.showwarning("未选择课程", "请先选择要删除的课程。", parent=window)
+            return
+        if not messagebox.askyesno("确认删除", f"确定删除选中的 {len(selected)} 门课程吗？", parent=window):
+            return
+        ids = [int(item_id) for item_id in selected]
+        placeholders = ",".join("?" for _ in ids)
+        with connect_db() as conn:
+            conn.execute(
+                f"DELETE FROM courses WHERE user_id = ? AND id IN ({placeholders})",
+                [self.user_id, *ids],
+            )
+            conn.commit()
+        self.fill_course_tree(tree)
+        self.refresh_tip()
+
+    def fill_assignment_tree(self, tree):
+        for item_id in tree.get_children():
+            tree.delete(item_id)
+        with connect_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM assignment_tasks
+                WHERE user_id = ?
+                ORDER BY updated_at DESC
+                """,
+                (self.user_id,),
+            ).fetchall()
+        rows = sorted(rows, key=lambda row: nearest_time_sort_key(row, ("deadline_time",)))
+        reminder_days = max(1, self.reminder_days.get())
+        for row in rows:
+            tree.insert(
+                "",
+                "end",
+                iid=str(row["id"]),
+                values=(
+                    row["platform_name"],
+                    row["course_name"],
+                    row["task_type"],
+                    row["task_title"],
+                    row["deadline_time"] or "暂无",
+                    calculated_assignment_status(row, reminder_days),
+                ),
+            )
+
+    def delete_selected_assignments(self, tree, window):
+        selected = tree.selection()
+        if not selected:
+            messagebox.showwarning("未选择作业", "请先选择要删除的作业/测试任务。", parent=window)
+            return
+        if not messagebox.askyesno("确认删除", f"确定删除选中的 {len(selected)} 条作业/测试任务吗？", parent=window):
+            return
+        ids = [int(item_id) for item_id in selected]
+        placeholders = ",".join("?" for _ in ids)
+        with connect_db() as conn:
+            conn.execute(
+                f"DELETE FROM assignment_tasks WHERE user_id = ? AND id IN ({placeholders})",
+                [self.user_id, *ids],
+            )
+            conn.commit()
+        self.fill_assignment_tree(tree)
+        self.refresh_tip()
+
+    def open_reminder_settings(self):
+        window = tk.Toplevel(self.root)
+        window.title("提醒设置")
+        window.geometry("380x250")
+        window.configure(bg="#f6f8fe")
+        window.transient(self.root)
+
+        frame = ttk.Frame(window, padding=20)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="提前几天提醒").pack(anchor="w", pady=(0, 8))
+        ttk.Spinbox(frame, from_=1, to=30, textvariable=self.reminder_days, width=10).pack(anchor="w")
+        ttk.Label(frame, text="当前为打开程序时自动检查，并可手动点击“即将截止”。").pack(
+            anchor="w", pady=(18, 10)
+        )
+        ttk.Button(frame, text="保存提醒设置", command=lambda: self.save_reminder_settings(window)).pack(anchor="w")
+        ttk.Button(frame, text="立即检查", command=self.show_reminders).pack(anchor="w")
+
+    def save_reminder_settings(self, window=None):
+        days = min(30, max(1, self.reminder_days.get()))
+        self.reminder_days.set(days)
+        set_setting(self.user_id, "reminder_days", days)
+        self.refresh_tip()
+        messagebox.showinfo("提醒设置", f"已保存：提前 {days} 天提醒。", parent=window or self.root)
+
+    def build_reminders(self):
+        reminder_days = max(1, self.reminder_days.get())
+        reminders = []
+        with connect_db() as conn:
+            self.mark_expired_assignments(conn)
+            conn.commit()
+            rows = conn.execute(
+                """
+                SELECT * FROM courses
+                WHERE user_id = ?
+                ORDER BY deadline_time IS NULL, deadline_time ASC
+                """,
+                (self.user_id,),
+            ).fetchall()
+            assignment_rows = conn.execute(
+                """
+                SELECT * FROM assignment_tasks
+                WHERE user_id = ?
+                ORDER BY deadline_time IS NULL, deadline_time ASC
+                """,
+                (self.user_id,),
+            ).fetchall()
+
+        for row in rows:
+            prefix = f"[{row['platform_name']}] {row['course_name']}"
+            deadline = parse_time(row["deadline_time"])
+            deadline_state = reminder_state(deadline, reminder_days)
+            if deadline_state:
+                if deadline_state["state"] == "expired":
+                    reminders.append(f"已逾期：{prefix}，截止 {row['deadline_time']}")
+                else:
+                    reminders.append(
+                        f"即将截止：{prefix}，还剩 {deadline_state['days_left']} 天，截止 {row['deadline_time']}"
+                    )
+
+            exam_time = parse_time(row["exam_time"])
+            exam_state = reminder_state(exam_time, reminder_days)
+            if exam_state:
+                if exam_state["state"] == "expired":
+                    reminders.append(f"考试已逾期：{prefix}，考试 {row['exam_time']}")
+                else:
+                    reminders.append(f"即将考试：{prefix}，还剩 {exam_state['days_left']} 天，考试 {row['exam_time']}")
+
+        for row in assignment_rows:
+            prefix = f"[{row['platform_name']}] {row['course_name']}：{row['task_type']} {row['task_title']}"
+            deadline = parse_time(row["deadline_time"])
+            deadline_state = reminder_state(deadline, reminder_days)
+            if not deadline_state:
+                continue
+            if deadline_state["state"] == "expired":
+                reminders.append(f"作业已逾期：{prefix}，截止 {row['deadline_time']}")
+            else:
+                reminders.append(
+                    f"作业即将截止：{prefix}，还剩 {deadline_state['days_left']} 天，截止 {row['deadline_time']}"
+                )
+        return reminders
+
+    def refresh_tip(self):
+        reminders = self.build_reminders()
+        if hasattr(self, "tip_var"):
+            self.tip_var.set(f"{len(reminders)} 个临期提醒" if reminders else "暂无临期任务")
+
+    def show_startup_reminders(self):
+        reminders = self.build_reminders()
+        self.refresh_tip()
+        if reminders:
+            messagebox.showwarning("网课任务提醒", "\n".join(reminders[:8]), parent=self.root)
+
+    def show_reminders(self):
+        reminders = self.build_reminders()
+        self.refresh_tip()
+        if reminders:
+            messagebox.showwarning("网课任务提醒", "\n".join(reminders[:10]), parent=self.root)
+        else:
+            messagebox.showinfo("网课任务提醒", "暂无临期任务。", parent=self.root)
+
+
+def main():
+    root = tk.Tk()
+    MiniReminderApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
