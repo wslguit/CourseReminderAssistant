@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}绑定{{ platform_name }}接口 - 网课聚合提醒平台{% endblock %}
+{% block content %}
+<header class="page-header">
+    <div>
+        <p class="eyebrow">接口授权绑定</p>
+        <h1>绑定 {{ platform_name }}</h1>
+    </div>
+    <a class="button" href="{{ url_for('platforms') }}">返回平台</a>
+</header>
+
+<section class="detail-grid">
+    <form class="panel account-form" method="post">
+        <h2>填写课程接口信息</h2>
+        <p class="muted">
+            先在浏览器里登录 {{ platform_name }}，进入“我的课程”页面，从开发者工具 Network 里复制课程列表接口。
+            系统只使用你主动提供的 Cookie 调用接口读取课程信息，不保存平台账号密码。
+        </p>
+
+        <label>
+            请求方式
+            <select name="api_method">
+                <option value="GET" {{ 'selected' if not account or account.api_method != 'POST' else '' }}>GET</option>
+                <option value="POST" {{ 'selected' if account and account.api_method == 'POST' else '' }}>POST</option>
+            </select>
+        </label>
+
+        <label>
+            课程接口 URL
+            <input name="api_url" value="{{ account.api_url if account else '' }}" placeholder="例如：https://.../course/list">
+        </label>
+
+        <label>
+            Cookie
+            <textarea name="auth_cookie" rows="6" placeholder="从 Request Headers 里复制 Cookie">{{ account.auth_cookie if account else '' }}</textarea>
+        </label>
+
+        <label>
+            请求体参数（POST 时填写）
+            <textarea name="api_body" rows="4" placeholder="例如：courseType=1&courseFolderId=0&query=&pageHeader=-1&single=0&superstarClass=0&isFirefly=0">{{ account.api_body if account else '' }}</textarea>
+        </label>
+
+        <label>
+            Referer（可选）
+            <input name="referer" value="{{ account.referer if account else '' }}" placeholder="课程页面地址，部分平台会校验">
+        </label>
+
+        <label>
+            User-Agent（可选）
+            <input name="user_agent" value="{{ account.user_agent if account else '' }}" placeholder="不填则使用默认浏览器 User-Agent">
+        </label>
+
+        <button class="primary" type="submit">保存接口授权</button>
+    </form>
+
+    <div class="panel">
+        <h2>如何复制接口</h2>
+        <div class="steps">
+            <p><strong>1</strong><span>在浏览器正常登录 {{ platform_name }}。</span></p>
+            {% if platform_name == '中国大学 MOOC' %}
+            <p><strong>2</strong><span>进入“我的课程 -> SPOC课程”，只找返回 SPOC 课程列表的接口。</span></p>
+            {% elif platform_name == '学习通' %}
+            <p><strong>2</strong><span>进入“课程 -> 我学的课”，只找返回我学课程列表的接口。</span></p>
+            {% elif platform_name == '智慧树' %}
+            <p><strong>2</strong><span>进入“智慧课程 -> 进行中”，只找返回进行中课程列表的接口。</span></p>
+            {% elif platform_name == '雨课堂' %}
+            <p><strong>2</strong><span>进入“课程班级 -> 我听的课”，只找返回我听课程列表的接口。</span></p>
+            {% else %}
+            <p><strong>2</strong><span>进入能看到自己课程的页面，只找返回本人课程列表的接口。</span></p>
+            {% endif %}
+            <p><strong>3</strong><span>按 F12 打开开发者工具，切到 Network / 网络。</span></p>
+            <p><strong>4</strong><span>筛选 Fetch/XHR，然后刷新页面。</span></p>
+            <p><strong>5</strong><span>找到包含 course、clazz、mycourse、studentcourse、classroom、lesson 等关键词的请求。</span></p>
+            <p><strong>6</strong><span>复制 Request URL、Cookie，POST 接口还要复制 Form Data / Payload。</span></p>
+            <p><strong>7</strong><span>保存后回到平台绑定页点击“读取课程”。</span></p>
+        </div>
+        {% if login_url %}
+        <p class="muted">平台入口：<a href="{{ login_url }}" target="_blank" rel="noreferrer">{{ login_url }}</a></p>
+        {% endif %}
+        <p class="muted">
+            注意：Cookie 可能会过期。读取失败时，重新登录平台并复制新的 Cookie 即可。
+            如果接口返回 JSON 字段特殊，把返回示例发给我，我可以继续适配解析规则。
+        </p>
+    </div>
+</section>
+{% endblock %}
