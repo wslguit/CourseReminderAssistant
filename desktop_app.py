@@ -882,7 +882,7 @@ class MiniReminderApp:
             "user_agent": tk.StringVar(value=account.get("user_agent", DEFAULT_USER_AGENT)),
         }
 
-        frame = self._build_form_shell(
+        frame, actions = self._build_scrollable_form_shell(
             window,
             "读取作业",
             "读取学校作业平台通知，自动同步未逾期的作业和测试",
@@ -923,8 +923,6 @@ class MiniReminderApp:
         self._form_label(frame, "User-Agent")
         self._form_entry(frame, fields["user_agent"]).pack(fill="x", pady=(4, 12))
 
-        actions = tk.Frame(frame, bg="#ffffff")
-        actions.pack(fill="x")
         self._pill_button(actions, "保存", lambda: self.save_assignment_account(window, fields), THEME["purple"]).pack(side="left", padx=(0, 8))
         self._pill_button(actions, "保存并读取作业", lambda: self.sync_assignments(window, fields), THEME["orange"]).pack(side="left")
 
