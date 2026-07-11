@@ -2,6 +2,7 @@ import os
 import sys
 import sqlite3
 import threading
+import webbrowser
 from datetime import datetime
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -13,6 +14,7 @@ from platform_api import (
     ScraperError,
     crawl_assignment_tasks,
     crawl_platform_courses,
+    platform_login_url,
     supported_assignment_platforms,
     supported_platforms,
 )
@@ -57,6 +59,7 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
+ASSIGNMENT_COMPLETED_STATUS = "已完成"
 
 THEME = {
     "bg": "#edf6ff",
@@ -393,7 +396,13 @@ class MiniReminderApp:
         self.root.resizable(False, False)
 
         self._build_mini_window()
+        self.root.after(0, self.position_main_window_bottom_right)
         self.root.after(1000, self.run_startup_sync_or_reminders)
+
+    def position_main_window_bottom_right(self):
+        self.root.geometry(self._bottom_right_geometry(500, 322))
+        self.root.deiconify()
+        self.root.lift()
 
     def _bottom_right_geometry(self, width, height):
         self.root.update_idletasks()
@@ -804,14 +813,25 @@ class MiniReminderApp:
             if "status_label" in fields:
                 self.refresh_course_config_status(fields)
 
+        def open_selected_platform():
+            platform_name = fields["platform"].get()
+            url = platform_login_url(platform_name)
+            if not url:
+                messagebox.showwarning("没有平台链接", f"暂未配置 {platform_name} 的打开链接。", parent=window)
+                return
+            webbrowser.open(url)
+
         self._form_label(frame, "平台")
+        platform_row = tk.Frame(frame, bg="#ffffff")
+        platform_row.pack(fill="x", pady=(4, 10))
         platform_box = ttk.Combobox(
-            frame,
+            platform_row,
             textvariable=fields["platform"],
             values=supported_platforms(),
             state="readonly",
         )
-        platform_box.pack(fill="x", pady=(4, 10), ipady=4)
+        platform_box.pack(side="left", fill="x", expand=True, ipady=4)
+        self._pill_button(platform_row, "打开平台", open_selected_platform, THEME["blue"]).pack(side="left", padx=(8, 0))
         platform_box.bind("<<ComboboxSelected>>", load_selected_platform)
 
         status_label = tk.Label(
@@ -1199,7 +1219,10 @@ class MiniReminderApp:
                         task_url = excluded.task_url,
                         publish_time = excluded.publish_time,
                         deadline_time = excluded.deadline_time,
-                        status = excluded.status,
+                        status = CASE
+                            WHEN assignment_tasks.status = ? THEN assignment_tasks.status
+                            ELSE excluded.status
+                        END,
                         raw_text = excluded.raw_text,
                         updated_at = excluded.updated_at
                     """,
@@ -1217,6 +1240,7 @@ class MiniReminderApp:
                         item.get("raw_text") or "",
                         timestamp,
                         timestamp,
+                        ASSIGNMENT_COMPLETED_STATUS,
                     ),
                 )
             conn.execute(
@@ -1255,8 +1279,9 @@ class MiniReminderApp:
                   AND deadline_time IS NOT NULL
                   AND deadline_time < ?
                   AND status != ?
+                  AND status != ?
                 """,
-                ("已截止", now, self.user_id, platform_name, now, "已截止"),
+                ("已截止", now, self.user_id, platform_name, now, "已截止", ASSIGNMENT_COMPLETED_STATUS),
             )
         else:
             conn.execute(
@@ -1267,8 +1292,9 @@ class MiniReminderApp:
                   AND deadline_time IS NOT NULL
                   AND deadline_time < ?
                   AND status != ?
+                  AND status != ?
                 """,
-                ("已截止", now, self.user_id, now, "已截止"),
+                ("已截止", now, self.user_id, now, "已截止", ASSIGNMENT_COMPLETED_STATUS),
             )
 
     def run_startup_sync_or_reminders(self):
@@ -1390,7 +1416,12 @@ class MiniReminderApp:
             conn.commit()
             course_count = conn.execute("SELECT COUNT(*) AS total FROM courses WHERE user_id = ?", (self.user_id,)).fetchone()["total"]
             assignment_count = conn.execute(
-                "SELECT COUNT(*) AS total FROM assignment_tasks WHERE user_id = ?", (self.user_id,)
+                "SELECT COUNT(*) AS total FROM assignment_tasks WHERE user_id = ? AND status != ?",
+                (self.user_id, ASSIGNMENT_COMPLETED_STATUS),
+            ).fetchone()["total"]
+            completed_assignment_count = conn.execute(
+                "SELECT COUNT(*) AS total FROM assignment_tasks WHERE user_id = ? AND status = ?",
+                (self.user_id, ASSIGNMENT_COMPLETED_STATUS),
             ).fetchone()["total"]
 
         window = tk.Toplevel(self.root)
@@ -1453,8 +1484,10 @@ class MiniReminderApp:
 
         course_frame = ttk.Frame(notebook, padding=8, style="Wuwa.TFrame")
         assignment_frame = ttk.Frame(notebook, padding=8, style="Wuwa.TFrame")
+        completed_assignment_frame = ttk.Frame(notebook, padding=8, style="Wuwa.TFrame")
         notebook.add(course_frame, text="课程任务")
         notebook.add(assignment_frame, text="作业任务")
+        notebook.add(completed_assignment_frame, text="已完成")
 
         course_actions = tk.Frame(course_frame, bg=THEME["panel"])
         course_actions.pack(fill="x", pady=(0, 8))
@@ -1572,6 +1605,50 @@ class MiniReminderApp:
         self.configure_task_tree_columns(assignment_tree)
         self.fill_assignment_tree(assignment_tree)
         assignment_tree.bind("<Button-1>", lambda event: self.handle_tree_checkbox_click(assignment_tree, event))
+
+        completed_actions = tk.Frame(completed_assignment_frame, bg=THEME["panel"])
+        completed_actions.pack(fill="x", pady=(0, 8))
+        tk.Label(
+            completed_actions,
+            text=f"✓  共 {completed_assignment_count} 条已完成",
+            bg="#edf4ff",
+            fg="#5c7fc6",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            padx=12,
+            pady=5,
+        ).pack(side="left")
+
+        completed_assignment_table = tk.Frame(
+            completed_assignment_frame,
+            bg="#ffffff",
+            highlightbackground=THEME["line"],
+            highlightthickness=1,
+        )
+        completed_assignment_table.pack(fill="both", expand=True)
+        completed_assignment_tree = ttk.Treeview(
+            completed_assignment_table,
+            columns=assignment_columns,
+            show="headings",
+            selectmode="browse",
+            style="Wuwa.Treeview",
+        )
+        completed_assignment_tree.pack(fill="both", expand=True)
+        completed_assignment_tree.task_columns = assignment_columns
+        completed_assignment_tree.task_headings = assignment_headings
+        completed_assignment_tree.task_widths = assignment_widths
+        completed_assignment_tree.multi_select_mode = False
+        completed_assignment_tree.checked_ids = set()
+        self.configure_task_tree_columns(completed_assignment_tree)
+        self.fill_assignment_tree(completed_assignment_tree, completed=True)
+        self._small_action_button(
+            completed_actions,
+            "刷新",
+            lambda: self.fill_assignment_tree(completed_assignment_tree, completed=True),
+        ).pack(side="right")
+        assignment_tree.bind(
+            "<Button-3>",
+            lambda event: self.show_assignment_context_menu(event, assignment_tree, completed_assignment_tree),
+        )
 
         footer = tk.Frame(shell, bg=THEME["bg"])
         footer.pack(fill="x", pady=(10, 0))
@@ -1726,17 +1803,19 @@ class MiniReminderApp:
         self.fill_course_tree(tree)
         self.refresh_tip()
 
-    def fill_assignment_tree(self, tree):
+    def fill_assignment_tree(self, tree, completed=False):
         for item_id in tree.get_children():
             tree.delete(item_id)
         with connect_db() as conn:
+            status_operator = "=" if completed else "!="
             rows = conn.execute(
-                """
+                f"""
                 SELECT * FROM assignment_tasks
                 WHERE user_id = ?
+                  AND status {status_operator} ?
                 ORDER BY updated_at DESC
                 """,
-                (self.user_id,),
+                (self.user_id, ASSIGNMENT_COMPLETED_STATUS),
             ).fetchall()
         rows = sorted(rows, key=lambda row: nearest_time_sort_key(row, ("deadline_time",)))
         reminder_days = max(1, self.reminder_days.get())
@@ -1750,7 +1829,7 @@ class MiniReminderApp:
                 row["task_type"],
                 row["task_title"],
                 row["deadline_time"] or "暂无",
-                calculated_assignment_status(row, reminder_days),
+                ASSIGNMENT_COMPLETED_STATUS if completed else calculated_assignment_status(row, reminder_days),
             )
             if multi_mode:
                 values = (CHECKED_TEXT if item_id in checked_ids else UNCHECKED_TEXT, *values)
@@ -1760,6 +1839,36 @@ class MiniReminderApp:
                 iid=item_id,
                 values=values,
             )
+
+    def show_assignment_context_menu(self, event, assignment_tree, completed_assignment_tree):
+        row_id = assignment_tree.identify_row(event.y)
+        if not row_id:
+            return
+        assignment_tree.selection_set(row_id)
+        menu = tk.Menu(assignment_tree, tearoff=False)
+        menu.add_command(
+            label="已完成",
+            command=lambda: self.mark_assignment_completed(row_id, assignment_tree, completed_assignment_tree),
+        )
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def mark_assignment_completed(self, item_id, assignment_tree, completed_assignment_tree):
+        timestamp = now_text()
+        with connect_db() as conn:
+            conn.execute(
+                """
+                UPDATE assignment_tasks
+                SET status = ?, updated_at = ?
+                WHERE user_id = ? AND id = ?
+                """,
+                (ASSIGNMENT_COMPLETED_STATUS, timestamp, self.user_id, int(item_id)),
+            )
+            conn.commit()
+        assignment_tree.checked_ids = set()
+        completed_assignment_tree.checked_ids = set()
+        self.fill_assignment_tree(assignment_tree)
+        self.fill_assignment_tree(completed_assignment_tree, completed=True)
+        self.refresh_tip()
 
     def delete_selected_assignments(self, tree, window):
         selected = self.selected_task_ids(tree)
