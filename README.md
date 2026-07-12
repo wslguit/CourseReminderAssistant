@@ -24,6 +24,10 @@
 - 作业列表查看：任务列表里分为“课程任务”和“作业任务”两个板块
 - 课程/作业删除：支持选择后删除
 - 弹窗提醒：启动程序后自动检查 7 天内临期任务，也可以手动检查提醒
+- 已完成任务：作业可批量移入“已完成”，也可批量恢复为未完成
+- AI 学习规划：把未完成课程和任务摘要发送给 DeepSeek 生成计划，不会发送 Cookie
+- 自动同步：可在提醒设置中选择启动软件时自动同步已配置的平台
+- 开机启动：主窗口按钮和提醒设置都可以控制当前 Windows 用户的开机启动项
 
 ## 桌面版启动方式
 
@@ -42,6 +46,31 @@ python run_desktop.py
 启动后会在屏幕右下角显示一个小型浮窗，包含“任务列表、读取课程、读取作业、即将截止”四个入口。可以拖动浮窗位置，点击右上角 `x` 退出。
 
 点击“读取课程”后，可以选择“学习通”、“中国大学 MOOC”或“智慧树”，每个平台的接口信息会单独保存。点击“读取作业”后，填写学校作业平台通知接口信息。
+
+在“任务列表”的作业页勾选任务后，可以批量加入“已完成”；在“已完成”页勾选任务后，可以恢复为未完成。已完成作业不会再弹出提醒，也不会交给 AI 重新规划。
+
+“AI规划”需要用户自己的 DeepSeek API Key。课程名、任务名、截止时间和状态摘要会发送给 DeepSeek，Cookie 不会发送。Cookie 和 API Key 优先保存在 Windows 系统凭据库；凭据库不可用时才回退到本地数据库，设置窗口提供单独清除按钮。
+
+## 数据目录
+
+桌面版数据库位于 Windows `%APPDATA%\网课任务弹窗提醒助手\data.sqlite3`。旧版本如果在程序目录发现 `data.sqlite3`，首次启动会复制到该数据目录。数据库、Cookie、API Key、日志和构建产物都不会提交到 Git。
+
+## 打包 Windows 版本
+
+安装运行与开发依赖并执行测试：
+
+```powershell
+python -m pip install -r requirements-dev.txt
+pytest
+```
+
+生成 EXE 和 ZIP 发布包：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_package.ps1
+```
+
+版本号只维护在 `app_info.py`。打包脚本会自动读取该版本，并在 `release` 目录生成对应版本的 ZIP。
 
 ## 学习通接口填写方式
 
@@ -121,25 +150,11 @@ python run_desktop.py
 学校作业平台当前可用的通知接口示例：
 
 - 请求方式：`GET`
-- 作业通知接口 URL：`https://v.guet.edu.cn/.../ntf/users/115611/notifications?...&limit=5&additionalFields=total_count&removed=only_mobile`
+- 作业通知接口 URL：从浏览器开发者工具复制当前账号的完整通知接口，不要把其中的用户标识分享给他人
 - Cookie：从该请求的 Request Headers 里复制
 - Referer：从该请求的 Request Headers 里复制
 
 程序会自动按 `offset=0,5,10...95` 最多读取 20 页通知，只导入包含“作业/测试”和“截止时间”且尚未逾期的任务。已有作业如果超过截止时间，会在同步或提醒检查时更新为 `已截止`。
-
-## 网页原型
-
-项目里仍保留原来的 Flask 网页原型，方便展示网页端登录、绑定、课程筛选、批量清除等功能。
-
-```bash
-python run_server.py
-```
-
-浏览器打开：
-
-```text
-http://127.0.0.1:5000
-```
 
 ## 注意
 

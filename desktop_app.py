@@ -10,6 +10,8 @@ from tkinter import messagebox, ttk
 from ai_agent import INTRO_MESSAGE, LLMError, LearningAgent
 from app_info import APP_NAME, APP_VERSION
 from app_paths import database_path
+from credential_store import ai_key, cookie_key, delete_secret, get_secret, set_secret
+from database_schema import ensure_courses_schema, fallback_course_external_id
 from platform_api import (
     ScraperError,
     crawl_assignment_tasks,
@@ -18,6 +20,8 @@ from platform_api import (
     supported_assignment_platforms,
     supported_platforms,
 )
+from time_utils import parse_datetime
+from security_utils import validate_api_url
 
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -51,7 +55,7 @@ PLATFORM_DEFAULTS = {
 ASSIGNMENT_PLATFORM_DEFAULTS = {
     "学校作业平台": {
         "api_method": "GET",
-        "api_url": "https://v.guet.edu.cn/https/77726476706e69737468656265737421f3f8548e34357b1e791d8cb8d6502720ee3b03/ntf/users/115611/notifications?vpn-12-o2-courses.guet.edu.cn&limit=5&additionalFields=total_count&removed=only_mobile",
+        "api_url": "",
         "api_body": "",
     }
 }
@@ -85,6 +89,7 @@ def now_text():
 
 def connect_db():
     conn = sqlite3.connect(DATABASE)
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -120,23 +125,6 @@ def init_db():
                 FOREIGN KEY(user_id) REFERENCES users(id)
             );
 
-            CREATE TABLE IF NOT EXISTS courses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                platform_name TEXT NOT NULL,
-                course_name TEXT NOT NULL,
-                course_url TEXT,
-                teacher TEXT,
-                progress INTEGER NOT NULL DEFAULT 0,
-                deadline_time TEXT,
-                exam_time TEXT,
-                status TEXT NOT NULL DEFAULT '未完成',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(user_id, platform_name, course_name),
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            );
-
             CREATE TABLE IF NOT EXISTS app_settings (
                 user_id INTEGER NOT NULL,
                 setting_key TEXT NOT NULL,
@@ -166,6 +154,7 @@ def init_db():
             );
             """
         )
+        ensure_courses_schema(conn)
         for column in (
             "auth_cookie",
             "api_url",
@@ -192,15 +181,7 @@ def get_desktop_user_id():
         return cursor.lastrowid
 
 
-def parse_time(value):
-    if not value:
-        return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(value.strip(), fmt)
-        except ValueError:
-            continue
-    return None
+parse_time = parse_datetime
 
 
 def get_setting(user_id, key, default=""):
@@ -385,7 +366,6 @@ class MiniReminderApp:
         self.auto_start_button = None
         self._drag_start = None
         self.pet_image = None
-        self.pet_images = []
         self._configure_style()
 
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
@@ -586,23 +566,15 @@ class MiniReminderApp:
 
     def _place_pet_image_or_draw(self, parent, width, height):
         try:
-            image = tk.PhotoImage(file=PET_GIF_PATH)
+            image = tk.PhotoImage(file=PET_GIF_PATH, format="gif -index 0")
             ratio = max(1, max(image.width() // max(1, width), image.height() // max(1, height)))
-            pet_image = image.subsample(ratio, ratio)
-            self.pet_images.append(pet_image)
-            self.pet_image = pet_image
-            label = tk.Label(parent, image=pet_image, bg=THEME["bg"], cursor="hand2")
+            self.pet_image = image.subsample(ratio, ratio)
+            label = tk.Label(parent, image=self.pet_image, bg=THEME["bg"])
             label.place(relx=0.5, rely=0.5, anchor="center")
-            label.bind("<Button-1>", lambda _event: self.show_reminders())
-            label.bind("<ButtonPress-1>", self._start_drag)
-            label.bind("<B1-Motion>", self._drag_window)
         except tk.TclError:
-            mascot = tk.Canvas(parent, width=width, height=height, bg=THEME["bg"], highlightthickness=0, cursor="hand2")
+            mascot = tk.Canvas(parent, width=width, height=height, bg=THEME["bg"], highlightthickness=0)
             mascot.pack(fill="both", expand=True)
             self._draw_mascot(mascot)
-            mascot.bind("<Button-1>", lambda _event: self.show_reminders())
-            mascot.bind("<ButtonPress-1>", self._start_drag)
-            mascot.bind("<B1-Motion>", self._drag_window)
 
     def _draw_mascot(self, canvas):
         canvas.create_oval(46, 108, 130, 132, fill="#d9e8ff", outline="")
@@ -634,10 +606,11 @@ class MiniReminderApp:
             ).fetchone()
         if not account:
             return None
+        stored_cookie = account["auth_cookie"] or ""
         return {
             "api_method": account["api_method"] or "POST",
             "api_url": account["api_url"] or platform_default(platform_name, "api_url"),
-            "auth_cookie": account["auth_cookie"] or "",
+            "auth_cookie": get_secret(cookie_key("desktop", self.user_id, platform_name), stored_cookie),
             "api_body": account["api_body"] or platform_default(platform_name, "api_body"),
             "referer": account["referer"] or "",
             "user_agent": account["user_agent"] or DEFAULT_USER_AGENT,
@@ -651,10 +624,11 @@ class MiniReminderApp:
             ).fetchone()
         if not account:
             return None
+        stored_cookie = account["auth_cookie"] or ""
         return {
             "api_method": account["api_method"] or "GET",
             "api_url": account["api_url"] or assignment_platform_default(platform_name, "api_url"),
-            "auth_cookie": account["auth_cookie"] or "",
+            "auth_cookie": get_secret(cookie_key("desktop", self.user_id, platform_name), stored_cookie),
             "api_body": account["api_body"] or assignment_platform_default(platform_name, "api_body"),
             "referer": account["referer"] or "",
             "user_agent": account["user_agent"] or DEFAULT_USER_AGENT,
@@ -662,10 +636,11 @@ class MiniReminderApp:
 
     def save_account(self, window, fields):
         platform_name = fields["platform"].get().strip() or DEFAULT_PLATFORM
+        existing = self.get_account_config(platform_name) or {}
         config = {
             "api_method": fields["method"].get().strip() or "POST",
             "api_url": fields["api_url"].get().strip(),
-            "auth_cookie": fields["cookie"].get("1.0", "end").strip(),
+            "auth_cookie": fields["cookie"].get("1.0", "end").strip() or existing.get("auth_cookie", ""),
             "api_body": fields["body"].get("1.0", "end").strip(),
             "referer": fields["referer"].get().strip(),
             "user_agent": fields["user_agent"].get().strip() or DEFAULT_USER_AGENT,
@@ -676,6 +651,11 @@ class MiniReminderApp:
         if not config["auth_cookie"]:
             messagebox.showwarning("缺少 Cookie", f"请先填写从{platform_name}请求 Headers 里复制出来的 Cookie。", parent=window)
             return False
+        try:
+            validate_api_url(config["api_url"], platform_name)
+        except ValueError as exc:
+            messagebox.showwarning("接口地址不安全", str(exc), parent=window)
+            return False
         if platform_name == "中国大学 MOOC" and "csrfKey=" not in config["api_url"] and "NTESSTUDYSI=" not in config["auth_cookie"]:
             messagebox.showwarning(
                 "缺少 csrfKey",
@@ -685,6 +665,8 @@ class MiniReminderApp:
             return False
 
         timestamp = now_text()
+        stored_in_keyring = set_secret(cookie_key("desktop", self.user_id, platform_name), config["auth_cookie"])
+        database_cookie = "" if stored_in_keyring else config["auth_cookie"]
         with connect_db() as conn:
             conn.execute(
                 """
@@ -706,7 +688,7 @@ class MiniReminderApp:
                     self.user_id,
                     platform_name,
                     "已绑定",
-                    config["auth_cookie"],
+                    database_cookie,
                     config["api_url"],
                     config["referer"],
                     config["user_agent"],
@@ -720,12 +702,31 @@ class MiniReminderApp:
         messagebox.showinfo("保存成功", f"{platform_name}接口信息已保存。", parent=window)
         return True
 
+    def clear_platform_cookie(self, platform_name, window, fields=None):
+        delete_secret(cookie_key("desktop", self.user_id, platform_name))
+        with connect_db() as conn:
+            conn.execute(
+                """
+                UPDATE platform_accounts
+                SET auth_cookie = '', status = 'Cookie 已清除', updated_at = ?
+                WHERE user_id = ? AND platform_name = ?
+                """,
+                (now_text(), self.user_id, platform_name),
+            )
+            conn.commit()
+        if fields and "cookie" in fields:
+            fields["cookie"].delete("1.0", "end")
+        if fields and "status_label" in fields:
+            self.refresh_course_config_status(fields)
+        messagebox.showinfo("Cookie 已清除", f"已清除 {platform_name} 的 Cookie。", parent=window)
+
     def save_assignment_account(self, window, fields):
         platform_name = fields["platform"].get().strip() or "学校作业平台"
+        existing = self.get_assignment_account_config(platform_name) or {}
         config = {
             "api_method": fields["method"].get().strip() or "GET",
             "api_url": fields["api_url"].get().strip(),
-            "auth_cookie": fields["cookie"].get("1.0", "end").strip(),
+            "auth_cookie": fields["cookie"].get("1.0", "end").strip() or existing.get("auth_cookie", ""),
             "api_body": fields["body"].get("1.0", "end").strip(),
             "referer": fields["referer"].get().strip(),
             "user_agent": fields["user_agent"].get().strip() or DEFAULT_USER_AGENT,
@@ -736,8 +737,15 @@ class MiniReminderApp:
         if not config["auth_cookie"]:
             messagebox.showwarning("缺少 Cookie", "请先填写从学校作业平台请求 Headers 里复制出来的 Cookie。", parent=window)
             return False
+        try:
+            validate_api_url(config["api_url"], platform_name)
+        except ValueError as exc:
+            messagebox.showwarning("接口地址不安全", str(exc), parent=window)
+            return False
 
         timestamp = now_text()
+        stored_in_keyring = set_secret(cookie_key("desktop", self.user_id, platform_name), config["auth_cookie"])
+        database_cookie = "" if stored_in_keyring else config["auth_cookie"]
         with connect_db() as conn:
             conn.execute(
                 """
@@ -759,7 +767,7 @@ class MiniReminderApp:
                     self.user_id,
                     platform_name,
                     "已绑定",
-                    config["auth_cookie"],
+                    database_cookie,
                     config["api_url"],
                     config["referer"],
                     config["user_agent"],
@@ -806,7 +814,6 @@ class MiniReminderApp:
             fields["user_agent"].set(selected_account.get("user_agent", DEFAULT_USER_AGENT))
             if "cookie" in fields:
                 fields["cookie"].delete("1.0", "end")
-                fields["cookie"].insert("1.0", selected_account.get("auth_cookie", ""))
             if "body" in fields:
                 fields["body"].delete("1.0", "end")
                 fields["body"].insert("1.0", selected_account.get("api_body", platform_default(platform_name, "api_body")))
@@ -859,8 +866,8 @@ class MiniReminderApp:
         self._form_label(frame, "Cookie")
         cookie_text = self._form_text(frame, height=5)
         cookie_text.pack(fill="both", expand=True, pady=(4, 10))
-        cookie_text.insert("1.0", account.get("auth_cookie", ""))
         fields["cookie"] = cookie_text
+        self._form_label(frame, "已保存的 Cookie 不会回显；留空表示保持原值")
 
         self._form_label(frame, "请求体参数")
         body_text = self._form_text(frame, height=3)
@@ -884,6 +891,12 @@ class MiniReminderApp:
 
         self._pill_button(actions, "保存配置", save_and_refresh_status, THEME["purple"]).pack(side="left", padx=(0, 8))
         self._pill_button(actions, "保存并读取当前平台课程", sync_and_refresh_status, THEME["blue"]).pack(side="left")
+        self._pill_button(
+            actions,
+            "清除 Cookie",
+            lambda: self.clear_platform_cookie(fields["platform"].get(), window, fields),
+            THEME["red"],
+        ).pack(side="left", padx=(8, 0))
 
     def open_assignment_sync_settings(self):
         window = tk.Toplevel(self.root)
@@ -928,8 +941,8 @@ class MiniReminderApp:
         self._form_label(frame, "Cookie")
         cookie_text = self._form_text(frame, height=5)
         cookie_text.pack(fill="both", expand=True, pady=(4, 10))
-        cookie_text.insert("1.0", account.get("auth_cookie", ""))
         fields["cookie"] = cookie_text
+        self._form_label(frame, "已保存的 Cookie 不会回显；留空表示保持原值")
 
         self._form_label(frame, "请求体参数（GET 可留空）")
         body_text = self._form_text(frame, height=3)
@@ -945,6 +958,12 @@ class MiniReminderApp:
 
         self._pill_button(actions, "保存", lambda: self.save_assignment_account(window, fields), THEME["purple"]).pack(side="left", padx=(0, 8))
         self._pill_button(actions, "保存并读取作业", lambda: self.sync_assignments(window, fields), THEME["orange"]).pack(side="left")
+        self._pill_button(
+            actions,
+            "清除 Cookie",
+            lambda: self.clear_platform_cookie(fields["platform"].get(), window, fields),
+            THEME["red"],
+        ).pack(side="left", padx=(8, 0))
 
     def _build_form_shell(self, window, title, subtitle, icon):
         shell = tk.Frame(window, bg=THEME["bg"], padx=18, pady=16)
@@ -1163,10 +1182,11 @@ class MiniReminderApp:
                 conn.execute(
                     """
                     INSERT INTO courses
-                        (user_id, platform_name, course_name, course_url, teacher, progress,
+                        (user_id, platform_name, external_id, course_name, course_url, teacher, progress,
                          deadline_time, exam_time, status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(user_id, platform_name, course_name) DO UPDATE SET
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, platform_name, external_id) DO UPDATE SET
+                        course_name = excluded.course_name,
                         course_url = excluded.course_url,
                         teacher = excluded.teacher,
                         progress = excluded.progress,
@@ -1178,6 +1198,9 @@ class MiniReminderApp:
                     (
                         self.user_id,
                         platform_name,
+                        item.get("external_id") or fallback_course_external_id(
+                            platform_name, item.get("course_name"), item.get("course_url")
+                        ),
                         item.get("course_name") or "未命名课程",
                         item.get("course_url") or "",
                         item.get("teacher") or "",
@@ -1197,7 +1220,6 @@ class MiniReminderApp:
                 """,
                 ("已获取课程", timestamp, timestamp, self.user_id, platform_name),
             )
-            self.cleanup_duplicate_courses(conn, platform_name)
             conn.commit()
         return courses
 
@@ -1359,8 +1381,9 @@ class MiniReminderApp:
     def dedupe_fetched_courses(self, courses):
         best = {}
         for item in courses:
-            name = item.get("course_name") or "未命名课程"
-            key = self.course_name_key(name)
+            key = item.get("external_id") or fallback_course_external_id(
+                "", item.get("course_name") or "未命名课程", item.get("course_url")
+            )
             old = best.get(key)
             if old is None or self.course_quality_score(item) > self.course_quality_score(old):
                 best[key] = item
@@ -1756,7 +1779,7 @@ class MiniReminderApp:
             rows = conn.execute(
                 """
                 SELECT * FROM courses
-                WHERE user_id = ?
+                WHERE user_id = ? AND status NOT IN ('已完成', '已结束')
                 ORDER BY updated_at DESC
                 """,
                 (self.user_id,),
@@ -2002,7 +2025,11 @@ class MiniReminderApp:
         ).pack(anchor="w")
         key_row = tk.Frame(key_card, bg="#ffffff")
         key_row.pack(fill="x", pady=(5, 0))
-        api_key_var = tk.StringVar(value=os.getenv("DEEPSEEK_API_KEY") or get_setting(self.user_id, "deepseek_api_key", ""))
+        stored_ai_key = get_setting(self.user_id, "deepseek_api_key", "")
+        api_key_var = tk.StringVar(
+            value=os.getenv("DEEPSEEK_API_KEY")
+            or get_secret(ai_key("desktop", self.user_id), stored_ai_key)
+        )
         api_key_entry = tk.Entry(
             key_row,
             textvariable=api_key_var,
@@ -2022,10 +2049,29 @@ class MiniReminderApp:
             if not key:
                 messagebox.showwarning("缺少 API Key", "请先填写 DeepSeek API Key。", parent=window)
                 return
-            set_setting(self.user_id, "deepseek_api_key", key)
-            messagebox.showinfo("保存成功", "AI API Key 已保存到本地数据库。", parent=window)
+            stored_in_keyring = set_secret(ai_key("desktop", self.user_id), key)
+            set_setting(self.user_id, "deepseek_api_key", "" if stored_in_keyring else key)
+            messagebox.showinfo(
+                "保存成功",
+                "AI API Key 已保存到系统凭据库。" if stored_in_keyring else "系统凭据库不可用，已保存到本地数据库。",
+                parent=window,
+            )
+
+        def clear_ai_key():
+            delete_secret(ai_key("desktop", self.user_id))
+            set_setting(self.user_id, "deepseek_api_key", "")
+            api_key_var.set("")
+            messagebox.showinfo("API Key 已清除", "已清除 DeepSeek API Key。", parent=window)
 
         self._small_action_button(key_row, "保存Key", save_ai_key).pack(side="left", padx=(8, 0))
+        self._small_action_button(key_row, "清除", clear_ai_key).pack(side="left", padx=(6, 0))
+        tk.Label(
+            key_card,
+            text="隐私提示：课程和任务摘要会发送给 DeepSeek，Cookie 不会发送。",
+            bg="#ffffff",
+            fg=THEME["muted"],
+            font=("Microsoft YaHei UI", 8),
+        ).pack(anchor="w", pady=(6, 0))
 
         chat_card = tk.Frame(shell, bg="#ffffff", highlightbackground=THEME["line"], highlightthickness=1, padx=12, pady=12)
         chat_card.pack(fill="both", expand=True)
@@ -2096,7 +2142,8 @@ class MiniReminderApp:
             if not api_key:
                 append_chat("assistant", "我还没有 DeepSeek API Key。请先在上方填写并保存 Key，再让我帮你规划。")
                 return
-            set_setting(self.user_id, "deepseek_api_key", api_key)
+            stored_in_keyring = set_secret(ai_key("desktop", self.user_id), api_key)
+            set_setting(self.user_id, "deepseek_api_key", "" if stored_in_keyring else api_key)
             courses, assignments = self.load_ai_learning_data()
             recent_history = history[-8:]
             set_busy(True)
@@ -2155,28 +2202,30 @@ class MiniReminderApp:
             course_rows = conn.execute(
                 """
                 SELECT * FROM courses
-                WHERE user_id = ?
+                WHERE user_id = ? AND status NOT IN ('已完成', '已结束')
                 """,
                 (self.user_id,),
             ).fetchall()
             assignment_rows = conn.execute(
                 """
                 SELECT * FROM assignment_tasks
-                WHERE user_id = ?
+                WHERE user_id = ? AND status != ?
                 """,
-                (self.user_id,),
+                (self.user_id, ASSIGNMENT_COMPLETED_STATUS),
             ).fetchall()
 
         courses = []
         for row in sorted(course_rows, key=lambda item: nearest_time_sort_key(item, ("deadline_time", "exam_time"))):
             item = dict(row)
-            item["status"] = calculated_course_status(row, reminder_days)
+            if row["status"] not in {"已完成", "已结束"}:
+                item["status"] = calculated_course_status(row, reminder_days)
             courses.append(item)
 
         assignments = []
         for row in sorted(assignment_rows, key=lambda item: nearest_time_sort_key(item, ("deadline_time",))):
             item = dict(row)
-            item["status"] = calculated_assignment_status(row, reminder_days)
+            if row["status"] != ASSIGNMENT_COMPLETED_STATUS:
+                item["status"] = calculated_assignment_status(row, reminder_days)
             assignments.append(item)
 
         return courses, assignments
@@ -2212,7 +2261,7 @@ class MiniReminderApp:
             rows = conn.execute(
                 """
                 SELECT * FROM courses
-                WHERE user_id = ?
+                WHERE user_id = ? AND status NOT IN ('已完成', '已结束')
                 ORDER BY deadline_time IS NULL, deadline_time ASC
                 """,
                 (self.user_id,),
@@ -2220,10 +2269,10 @@ class MiniReminderApp:
             assignment_rows = conn.execute(
                 """
                 SELECT * FROM assignment_tasks
-                WHERE user_id = ?
+                WHERE user_id = ? AND status != ?
                 ORDER BY deadline_time IS NULL, deadline_time ASC
                 """,
-                (self.user_id,),
+                (self.user_id, ASSIGNMENT_COMPLETED_STATUS),
             ).fetchall()
 
         for row in rows:
