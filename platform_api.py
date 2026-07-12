@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 import requests
 
 from time_utils import parse_datetime
+from security_utils import validate_api_url
 
 
 SUPPORTED_PLATFORMS = ["学习通", "中国大学 MOOC", "智慧树"]
@@ -44,6 +45,10 @@ def crawl_assignment_tasks(platform_name, account):
         raise ScraperError("请先填写该平台的 Cookie。")
     if platform_name != "学校作业平台":
         raise ScraperError(f"暂不支持读取 {platform_name} 作业任务。")
+    try:
+        validate_api_url(api_url, platform_name)
+    except ValueError as exc:
+        raise ScraperError(str(exc)) from exc
     return _crawl_school_assignment_tasks(api_url, cookie, account)
 
 
@@ -54,6 +59,10 @@ def crawl_platform_courses(platform_name, account):
         raise ScraperError("请先在平台绑定页填写课程接口 URL。")
     if not cookie:
         raise ScraperError("请先在平台绑定页填写该平台的 Cookie。")
+    try:
+        validate_api_url(api_url, platform_name)
+    except ValueError as exc:
+        raise ScraperError(str(exc)) from exc
 
     headers = {
         "Cookie": cookie,
