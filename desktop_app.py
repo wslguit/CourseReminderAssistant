@@ -10,6 +10,7 @@ from tkinter import messagebox, ttk
 from ai_agent import INTRO_MESSAGE, LLMError, LearningAgent
 from app_info import APP_NAME, APP_VERSION
 from app_paths import database_path
+from database_schema import ensure_courses_schema, fallback_course_external_id
 from platform_api import (
     ScraperError,
     crawl_assignment_tasks,
@@ -51,7 +52,7 @@ PLATFORM_DEFAULTS = {
 ASSIGNMENT_PLATFORM_DEFAULTS = {
     "学校作业平台": {
         "api_method": "GET",
-        "api_url": "https://v.guet.edu.cn/https/77726476706e69737468656265737421f3f8548e34357b1e791d8cb8d6502720ee3b03/ntf/users/115611/notifications?vpn-12-o2-courses.guet.edu.cn&limit=5&additionalFields=total_count&removed=only_mobile",
+        "api_url": "",
         "api_body": "",
     }
 }
@@ -120,23 +121,6 @@ def init_db():
                 FOREIGN KEY(user_id) REFERENCES users(id)
             );
 
-            CREATE TABLE IF NOT EXISTS courses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                platform_name TEXT NOT NULL,
-                course_name TEXT NOT NULL,
-                course_url TEXT,
-                teacher TEXT,
-                progress INTEGER NOT NULL DEFAULT 0,
-                deadline_time TEXT,
-                exam_time TEXT,
-                status TEXT NOT NULL DEFAULT '未完成',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(user_id, platform_name, course_name),
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            );
-
             CREATE TABLE IF NOT EXISTS app_settings (
                 user_id INTEGER NOT NULL,
                 setting_key TEXT NOT NULL,
@@ -166,6 +150,7 @@ def init_db():
             );
             """
         )
+        ensure_courses_schema(conn)
         for column in (
             "auth_cookie",
             "api_url",
@@ -386,6 +371,7 @@ class MiniReminderApp:
         self._drag_start = None
         self.pet_image = None
         self.pet_images = []
+        self.pet_animation_job = None
         self._configure_style()
 
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
@@ -586,14 +572,23 @@ class MiniReminderApp:
 
     def _place_pet_image_or_draw(self, parent, width, height):
         try:
-            image = tk.PhotoImage(file=PET_GIF_PATH)
-            ratio = max(1, max(image.width() // max(1, width), image.height() // max(1, height)))
-            pet_image = image.subsample(ratio, ratio)
-            self.pet_images.append(pet_image)
-            self.pet_image = pet_image
-            label = tk.Label(parent, image=pet_image, bg=THEME["bg"], cursor="hand2")
+            frames = []
+            frame_index = 0
+            while True:
+                try:
+                    frame = tk.PhotoImage(file=PET_GIF_PATH, format=f"gif -index {frame_index}")
+                except tk.TclError:
+                    break
+                ratio = max(1, max(frame.width() // max(1, width), frame.height() // max(1, height)))
+                frames.append(frame.subsample(ratio, ratio))
+                frame_index += 1
+            if not frames:
+                raise tk.TclError("GIF contains no readable frames")
+            self.pet_images = frames
+            self.pet_image = frames[0]
+            label = tk.Label(parent, image=frames[0], bg=THEME["bg"], cursor="hand2")
             label.place(relx=0.5, rely=0.5, anchor="center")
-            label.bind("<Button-1>", lambda _event: self.show_reminders())
+            label.bind("<ButtonRelease-1>", lambda _event: self._play_pet_animation(label))
             label.bind("<ButtonPress-1>", self._start_drag)
             label.bind("<B1-Motion>", self._drag_window)
         except tk.TclError:
@@ -603,6 +598,26 @@ class MiniReminderApp:
             mascot.bind("<Button-1>", lambda _event: self.show_reminders())
             mascot.bind("<ButtonPress-1>", self._start_drag)
             mascot.bind("<B1-Motion>", self._drag_window)
+
+    def _play_pet_animation(self, label):
+        if self.pet_animation_job is not None:
+            self.root.after_cancel(self.pet_animation_job)
+        self._show_pet_frame(label, 0)
+        self.show_reminders()
+
+    def _show_pet_frame(self, label, frame_index):
+        if not label.winfo_exists() or not self.pet_images:
+            self.pet_animation_job = None
+            return
+        if frame_index >= len(self.pet_images):
+            label.configure(image=self.pet_images[0])
+            self.pet_image = self.pet_images[0]
+            self.pet_animation_job = None
+            return
+        frame = self.pet_images[frame_index]
+        label.configure(image=frame)
+        self.pet_image = frame
+        self.pet_animation_job = self.root.after(90, self._show_pet_frame, label, frame_index + 1)
 
     def _draw_mascot(self, canvas):
         canvas.create_oval(46, 108, 130, 132, fill="#d9e8ff", outline="")
@@ -1163,10 +1178,11 @@ class MiniReminderApp:
                 conn.execute(
                     """
                     INSERT INTO courses
-                        (user_id, platform_name, course_name, course_url, teacher, progress,
+                        (user_id, platform_name, external_id, course_name, course_url, teacher, progress,
                          deadline_time, exam_time, status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(user_id, platform_name, course_name) DO UPDATE SET
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, platform_name, external_id) DO UPDATE SET
+                        course_name = excluded.course_name,
                         course_url = excluded.course_url,
                         teacher = excluded.teacher,
                         progress = excluded.progress,
@@ -1178,6 +1194,9 @@ class MiniReminderApp:
                     (
                         self.user_id,
                         platform_name,
+                        item.get("external_id") or fallback_course_external_id(
+                            platform_name, item.get("course_name"), item.get("course_url")
+                        ),
                         item.get("course_name") or "未命名课程",
                         item.get("course_url") or "",
                         item.get("teacher") or "",
@@ -1197,7 +1216,6 @@ class MiniReminderApp:
                 """,
                 ("已获取课程", timestamp, timestamp, self.user_id, platform_name),
             )
-            self.cleanup_duplicate_courses(conn, platform_name)
             conn.commit()
         return courses
 
@@ -1359,8 +1377,9 @@ class MiniReminderApp:
     def dedupe_fetched_courses(self, courses):
         best = {}
         for item in courses:
-            name = item.get("course_name") or "未命名课程"
-            key = self.course_name_key(name)
+            key = item.get("external_id") or fallback_course_external_id(
+                "", item.get("course_name") or "未命名课程", item.get("course_url")
+            )
             old = best.get(key)
             if old is None or self.course_quality_score(item) > self.course_quality_score(old):
                 best[key] = item
@@ -2170,13 +2189,15 @@ class MiniReminderApp:
         courses = []
         for row in sorted(course_rows, key=lambda item: nearest_time_sort_key(item, ("deadline_time", "exam_time"))):
             item = dict(row)
-            item["status"] = calculated_course_status(row, reminder_days)
+            if row["status"] not in {"已完成", "已结束"}:
+                item["status"] = calculated_course_status(row, reminder_days)
             courses.append(item)
 
         assignments = []
         for row in sorted(assignment_rows, key=lambda item: nearest_time_sort_key(item, ("deadline_time",))):
             item = dict(row)
-            item["status"] = calculated_assignment_status(row, reminder_days)
+            if row["status"] != ASSIGNMENT_COMPLETED_STATUS:
+                item["status"] = calculated_assignment_status(row, reminder_days)
             assignments.append(item)
 
         return courses, assignments
@@ -2212,7 +2233,7 @@ class MiniReminderApp:
             rows = conn.execute(
                 """
                 SELECT * FROM courses
-                WHERE user_id = ?
+                WHERE user_id = ? AND status NOT IN ('已完成', '已结束')
                 ORDER BY deadline_time IS NULL, deadline_time ASC
                 """,
                 (self.user_id,),
@@ -2220,10 +2241,10 @@ class MiniReminderApp:
             assignment_rows = conn.execute(
                 """
                 SELECT * FROM assignment_tasks
-                WHERE user_id = ?
+                WHERE user_id = ? AND status != ?
                 ORDER BY deadline_time IS NULL, deadline_time ASC
                 """,
-                (self.user_id,),
+                (self.user_id, ASSIGNMENT_COMPLETED_STATUS),
             ).fetchall()
 
         for row in rows:

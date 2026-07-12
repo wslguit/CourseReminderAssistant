@@ -1,10 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+import sys
 
 
 ROOT = Path.cwd()
-PY_ROOT = Path(r"C:\Users\Lenovo\.cache\codex-runtimes\codex-primary-runtime\dependencies\python")
+PY_ROOT = Path(sys.base_prefix)
 TCL_DIR = PY_ROOT / "tcl" / "tcl8.6"
 TK_DIR = PY_ROOT / "tcl" / "tk8.6"
 

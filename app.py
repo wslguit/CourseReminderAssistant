@@ -15,6 +15,8 @@ from flask import (
 )
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from database_schema import ensure_courses_schema, fallback_course_external_id
+
 from platform_api import (
     ScraperError,
     crawl_course_details,
@@ -71,24 +73,9 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
 
-        CREATE TABLE IF NOT EXISTS courses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            platform_name TEXT NOT NULL,
-            course_name TEXT NOT NULL,
-            course_url TEXT,
-            teacher TEXT,
-            progress INTEGER NOT NULL DEFAULT 0,
-            deadline_time TEXT,
-            exam_time TEXT,
-            status TEXT NOT NULL DEFAULT '未完成',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(user_id, platform_name, course_name),
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        );
         """
     )
+    ensure_courses_schema(db)
     ensure_column("platform_accounts", "platform_username", "TEXT")
     ensure_column("platform_accounts", "platform_password", "TEXT")
     ensure_column("platform_accounts", "last_sync_at", "TEXT")
@@ -164,6 +151,8 @@ def build_reminders(courses):
     reminders = []
     now = datetime.now()
     for course in courses:
+        if course["status"] in {"已完成", "已结束"}:
+            continue
         deadline = parse_dt(course["deadline_time"])
         exam = parse_dt(course["exam_time"])
         if deadline:
@@ -506,11 +495,12 @@ def sync_platform(platform_name):
         db.execute(
             """
             INSERT INTO courses
-                (user_id, platform_name, course_name, course_url, teacher, progress,
+                (user_id, platform_name, external_id, course_name, course_url, teacher, progress,
                  deadline_time, exam_time, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, platform_name, course_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, platform_name, external_id)
             DO UPDATE SET
+                course_name = excluded.course_name,
                 course_url = excluded.course_url,
                 teacher = excluded.teacher,
                 progress = excluded.progress,
@@ -522,6 +512,9 @@ def sync_platform(platform_name):
             (
                 g.user["id"],
                 platform_name,
+                item.get("external_id") or fallback_course_external_id(
+                    platform_name, item.get("course_name"), item.get("course_url")
+                ),
                 item["course_name"],
                 item["course_url"],
                 item["teacher"],
