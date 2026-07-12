@@ -81,11 +81,6 @@ def test_courses_migration_preserves_data_and_allows_same_name(tmp_path):
     conn.close()
 
 
-def test_pet_gif_has_finite_animation_frames():
-    frame_count = desktop_app.gif_frame_count(desktop_app.PET_GIF_PATH)
-    assert 1 < frame_count < 1000
-
-
 def test_desktop_reminders_skip_completed_items(tmp_path, monkeypatch):
     monkeypatch.setattr(desktop_app, "DATABASE", str(tmp_path / "reminders.sqlite3"))
     desktop_app.init_db()

@@ -33,56 +33,6 @@ def resource_path(relative_path):
     return os.path.join(root, relative_path)
 
 
-def gif_frame_count(path):
-    try:
-        with open(path, "rb") as gif_file:
-            data = gif_file.read()
-    except OSError:
-        return 0
-    if len(data) < 13 or data[:3] != b"GIF":
-        return 0
-
-    offset = 13
-    packed = data[10]
-    if packed & 0x80:
-        offset += 3 * (2 ** ((packed & 0x07) + 1))
-
-    frames = 0
-    while offset < len(data):
-        marker = data[offset]
-        offset += 1
-        if marker == 0x3B:
-            break
-        if marker == 0x21:
-            if offset >= len(data):
-                break
-            offset += 1
-            while offset < len(data):
-                block_size = data[offset]
-                offset += 1
-                if block_size == 0:
-                    break
-                offset += block_size
-            continue
-        if marker != 0x2C or offset + 9 > len(data):
-            break
-        frames += 1
-        image_packed = data[offset + 8]
-        offset += 9
-        if image_packed & 0x80:
-            offset += 3 * (2 ** ((image_packed & 0x07) + 1))
-        if offset >= len(data):
-            break
-        offset += 1
-        while offset < len(data):
-            block_size = data[offset]
-            offset += 1
-            if block_size == 0:
-                break
-            offset += block_size
-    return frames
-
-
 PET_GIF_PATH = resource_path(os.path.join("assets", "phoebe_pet.gif"))
 DEFAULT_PLATFORM = "学习通"
 PLATFORM_DEFAULTS = {
@@ -416,8 +366,6 @@ class MiniReminderApp:
         self.auto_start_button = None
         self._drag_start = None
         self.pet_image = None
-        self.pet_images = []
-        self.pet_animation_job = None
         self._configure_style()
 
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
@@ -618,48 +566,15 @@ class MiniReminderApp:
 
     def _place_pet_image_or_draw(self, parent, width, height):
         try:
-            frames = []
-            frame_count = gif_frame_count(PET_GIF_PATH)
-            for frame_index in range(frame_count):
-                frame = tk.PhotoImage(file=PET_GIF_PATH, format=f"gif -index {frame_index}")
-                ratio = max(1, max(frame.width() // max(1, width), frame.height() // max(1, height)))
-                frames.append(frame.subsample(ratio, ratio))
-            if not frames:
-                raise tk.TclError("GIF contains no readable frames")
-            self.pet_images = frames
-            self.pet_image = frames[0]
-            label = tk.Label(parent, image=frames[0], bg=THEME["bg"], cursor="hand2")
+            image = tk.PhotoImage(file=PET_GIF_PATH, format="gif -index 0")
+            ratio = max(1, max(image.width() // max(1, width), image.height() // max(1, height)))
+            self.pet_image = image.subsample(ratio, ratio)
+            label = tk.Label(parent, image=self.pet_image, bg=THEME["bg"])
             label.place(relx=0.5, rely=0.5, anchor="center")
-            label.bind("<ButtonRelease-1>", lambda _event: self._play_pet_animation(label))
-            label.bind("<ButtonPress-1>", self._start_drag)
-            label.bind("<B1-Motion>", self._drag_window)
         except tk.TclError:
-            mascot = tk.Canvas(parent, width=width, height=height, bg=THEME["bg"], highlightthickness=0, cursor="hand2")
+            mascot = tk.Canvas(parent, width=width, height=height, bg=THEME["bg"], highlightthickness=0)
             mascot.pack(fill="both", expand=True)
             self._draw_mascot(mascot)
-            mascot.bind("<Button-1>", lambda _event: self.show_reminders())
-            mascot.bind("<ButtonPress-1>", self._start_drag)
-            mascot.bind("<B1-Motion>", self._drag_window)
-
-    def _play_pet_animation(self, label):
-        if self.pet_animation_job is not None:
-            self.root.after_cancel(self.pet_animation_job)
-        self._show_pet_frame(label, 0)
-        self.show_reminders()
-
-    def _show_pet_frame(self, label, frame_index):
-        if not label.winfo_exists() or not self.pet_images:
-            self.pet_animation_job = None
-            return
-        if frame_index >= len(self.pet_images):
-            label.configure(image=self.pet_images[0])
-            self.pet_image = self.pet_images[0]
-            self.pet_animation_job = None
-            return
-        frame = self.pet_images[frame_index]
-        label.configure(image=frame)
-        self.pet_image = frame
-        self.pet_animation_job = self.root.after(90, self._show_pet_frame, label, frame_index + 1)
 
     def _draw_mascot(self, canvas):
         canvas.create_oval(46, 108, 130, 132, fill="#d9e8ff", outline="")
