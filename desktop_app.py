@@ -33,6 +33,56 @@ def resource_path(relative_path):
     return os.path.join(root, relative_path)
 
 
+def gif_frame_count(path):
+    try:
+        with open(path, "rb") as gif_file:
+            data = gif_file.read()
+    except OSError:
+        return 0
+    if len(data) < 13 or data[:3] != b"GIF":
+        return 0
+
+    offset = 13
+    packed = data[10]
+    if packed & 0x80:
+        offset += 3 * (2 ** ((packed & 0x07) + 1))
+
+    frames = 0
+    while offset < len(data):
+        marker = data[offset]
+        offset += 1
+        if marker == 0x3B:
+            break
+        if marker == 0x21:
+            if offset >= len(data):
+                break
+            offset += 1
+            while offset < len(data):
+                block_size = data[offset]
+                offset += 1
+                if block_size == 0:
+                    break
+                offset += block_size
+            continue
+        if marker != 0x2C or offset + 9 > len(data):
+            break
+        frames += 1
+        image_packed = data[offset + 8]
+        offset += 9
+        if image_packed & 0x80:
+            offset += 3 * (2 ** ((image_packed & 0x07) + 1))
+        if offset >= len(data):
+            break
+        offset += 1
+        while offset < len(data):
+            block_size = data[offset]
+            offset += 1
+            if block_size == 0:
+                break
+            offset += block_size
+    return frames
+
+
 PET_GIF_PATH = resource_path(os.path.join("assets", "phoebe_pet.gif"))
 DEFAULT_PLATFORM = "学习通"
 PLATFORM_DEFAULTS = {
@@ -569,15 +619,11 @@ class MiniReminderApp:
     def _place_pet_image_or_draw(self, parent, width, height):
         try:
             frames = []
-            frame_index = 0
-            while True:
-                try:
-                    frame = tk.PhotoImage(file=PET_GIF_PATH, format=f"gif -index {frame_index}")
-                except tk.TclError:
-                    break
+            frame_count = gif_frame_count(PET_GIF_PATH)
+            for frame_index in range(frame_count):
+                frame = tk.PhotoImage(file=PET_GIF_PATH, format=f"gif -index {frame_index}")
                 ratio = max(1, max(frame.width() // max(1, width), frame.height() // max(1, height)))
                 frames.append(frame.subsample(ratio, ratio))
-                frame_index += 1
             if not frames:
                 raise tk.TclError("GIF contains no readable frames")
             self.pet_images = frames

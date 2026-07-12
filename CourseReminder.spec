@@ -1,19 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+import os
 import sys
 
 
 ROOT = Path.cwd()
 PY_ROOT = Path(sys.base_prefix)
-TCL_DIR = PY_ROOT / "tcl" / "tcl8.6"
-TK_DIR = PY_ROOT / "tcl" / "tk8.6"
+TCL_DIR = Path(os.environ.get("TCL_LIBRARY", PY_ROOT / "tcl" / "tcl8.6"))
+TK_DIR = Path(os.environ.get("TK_LIBRARY", PY_ROOT / "tcl" / "tk8.6"))
 
-datas = [
-    (str(ROOT / "assets"), "assets"),
-    (str(TCL_DIR), "_tcl_data"),
-    (str(TK_DIR), "_tk_data"),
-]
+datas = [(str(ROOT / "assets"), "assets")]
+if TCL_DIR.exists():
+    datas.append((str(TCL_DIR), "_tcl_data"))
+if TK_DIR.exists():
+    datas.append((str(TK_DIR), "_tk_data"))
 
 
 a = Analysis(
