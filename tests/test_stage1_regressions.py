@@ -113,6 +113,36 @@ def test_desktop_reminders_skip_completed_items(tmp_path, monkeypatch):
     assert app.build_reminders() == []
 
 
+def test_assignment_can_move_to_completed_and_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(desktop_app, "DATABASE", str(tmp_path / "status.sqlite3"))
+    desktop_app.init_db()
+    app = desktop_app.MiniReminderApp.__new__(desktop_app.MiniReminderApp)
+    app.user_id = desktop_app.get_desktop_user_id()
+    now = desktop_app.now_text()
+    with desktop_app.connect_db() as conn:
+        task_id = conn.execute(
+            """
+            INSERT INTO assignment_tasks
+                (user_id, platform_name, task_type, course_name, task_title,
+                 status, external_id, created_at, updated_at)
+            VALUES (?, '学校作业平台', '作业', '测试课程', '状态切换任务',
+                    '进行中', 'status-task', ?, ?)
+            """,
+            (app.user_id, now, now),
+        ).lastrowid
+        conn.commit()
+
+    app.update_assignment_statuses([task_id], desktop_app.ASSIGNMENT_COMPLETED_STATUS)
+    with desktop_app.connect_db() as conn:
+        status = conn.execute("SELECT status FROM assignment_tasks WHERE id = ?", (task_id,)).fetchone()["status"]
+    assert status == desktop_app.ASSIGNMENT_COMPLETED_STATUS
+
+    app.update_assignment_statuses([task_id], "进行中")
+    with desktop_app.connect_db() as conn:
+        status = conn.execute("SELECT status FROM assignment_tasks WHERE id = ?", (task_id,)).fetchone()["status"]
+    assert status == "进行中"
+
+
 def test_ai_learning_data_excludes_terminal_statuses(tmp_path, monkeypatch):
     monkeypatch.setattr(desktop_app, "DATABASE", str(tmp_path / "ai.sqlite3"))
     desktop_app.init_db()
