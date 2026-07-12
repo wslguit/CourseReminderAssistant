@@ -1568,7 +1568,7 @@ class MiniReminderApp:
 
         assignment_actions = tk.Frame(assignment_frame, bg=THEME["panel"])
         assignment_actions.pack(fill="x", pady=(0, 8))
-        tk.Label(
+        assignment_count_label = tk.Label(
             assignment_actions,
             text=f"⟳  共 {assignment_count} 条任务",
             bg="#edf4ff",
@@ -1576,7 +1576,8 @@ class MiniReminderApp:
             font=("Microsoft YaHei UI", 9, "bold"),
             padx=12,
             pady=5,
-        ).pack(side="left")
+        )
+        assignment_count_label.pack(side="left")
         self._small_action_button(assignment_actions, "刷新", lambda: self.fill_assignment_tree(assignment_tree)).pack(
             side="right", padx=(8, 0)
         )
@@ -1586,6 +1587,17 @@ class MiniReminderApp:
             lambda: self.delete_selected_assignments(assignment_tree, window),
             danger=True,
         ).pack(side="right")
+        self._small_action_button(
+            assignment_actions,
+            "加入已完成",
+            lambda: self.mark_selected_assignments_status(
+                assignment_tree,
+                completed_assignment_tree,
+                ASSIGNMENT_COMPLETED_STATUS,
+                assignment_count_label,
+                completed_count_label,
+            ),
+        ).pack(side="right", padx=(8, 8))
 
         assignment_columns = ("platform_name", "course_name", "task_type", "task_title", "deadline_time", "status")
         assignment_table = tk.Frame(assignment_frame, bg="#ffffff", highlightbackground=THEME["line"], highlightthickness=1)
@@ -1631,7 +1643,7 @@ class MiniReminderApp:
 
         completed_actions = tk.Frame(completed_assignment_frame, bg=THEME["panel"])
         completed_actions.pack(fill="x", pady=(0, 8))
-        tk.Label(
+        completed_count_label = tk.Label(
             completed_actions,
             text=f"✓  共 {completed_assignment_count} 条已完成",
             bg="#edf4ff",
@@ -1639,7 +1651,8 @@ class MiniReminderApp:
             font=("Microsoft YaHei UI", 9, "bold"),
             padx=12,
             pady=5,
-        ).pack(side="left")
+        )
+        completed_count_label.pack(side="left")
 
         completed_assignment_table = tk.Frame(
             completed_assignment_frame,
@@ -1668,6 +1681,32 @@ class MiniReminderApp:
             "刷新",
             lambda: self.fill_assignment_tree(completed_assignment_tree, completed=True),
         ).pack(side="right")
+        self._small_action_button(
+            completed_actions,
+            "未完成",
+            lambda: self.mark_selected_assignments_status(
+                completed_assignment_tree,
+                assignment_tree,
+                "进行中",
+                assignment_count_label,
+                completed_count_label,
+                source_completed=True,
+            ),
+        ).pack(side="right", padx=(8, 8))
+        completed_multi_button = self._small_action_button(
+            completed_actions,
+            "多选",
+            lambda: self.toggle_tree_multi_select(
+                completed_assignment_tree,
+                completed_multi_button,
+                lambda tree: self.fill_assignment_tree(tree, completed=True),
+            ),
+        )
+        completed_multi_button.pack(side="right")
+        completed_assignment_tree.bind(
+            "<Button-1>",
+            lambda event: self.handle_tree_checkbox_click(completed_assignment_tree, event),
+        )
         assignment_tree.bind(
             "<Button-3>",
             lambda event: self.show_assignment_context_menu(event, assignment_tree, completed_assignment_tree),
@@ -1876,22 +1915,64 @@ class MiniReminderApp:
         menu.tk_popup(event.x_root, event.y_root)
 
     def mark_assignment_completed(self, item_id, assignment_tree, completed_assignment_tree):
-        timestamp = now_text()
-        with connect_db() as conn:
-            conn.execute(
-                """
-                UPDATE assignment_tasks
-                SET status = ?, updated_at = ?
-                WHERE user_id = ? AND id = ?
-                """,
-                (ASSIGNMENT_COMPLETED_STATUS, timestamp, self.user_id, int(item_id)),
-            )
-            conn.commit()
+        self.update_assignment_statuses([item_id], ASSIGNMENT_COMPLETED_STATUS)
         assignment_tree.checked_ids = set()
         completed_assignment_tree.checked_ids = set()
         self.fill_assignment_tree(assignment_tree)
         self.fill_assignment_tree(completed_assignment_tree, completed=True)
         self.refresh_tip()
+
+    def mark_selected_assignments_status(
+        self,
+        source_tree,
+        other_tree,
+        status,
+        assignment_count_label=None,
+        completed_count_label=None,
+        source_completed=False,
+    ):
+        selected = self.selected_task_ids(source_tree)
+        if not selected:
+            messagebox.showwarning("未选择项目", "请先点击多选并勾选任务。", parent=source_tree.winfo_toplevel())
+            return
+        self.update_assignment_statuses(selected, status)
+        source_tree.checked_ids = set()
+        other_tree.checked_ids = set()
+        self.fill_assignment_tree(source_tree, completed=source_completed)
+        self.fill_assignment_tree(other_tree, completed=not source_completed)
+        self.refresh_assignment_count_labels(assignment_count_label, completed_count_label)
+        self.refresh_tip()
+
+    def update_assignment_statuses(self, item_ids, status):
+        ids = [int(item_id) for item_id in item_ids]
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        with connect_db() as conn:
+            conn.execute(
+                f"""
+                UPDATE assignment_tasks
+                SET status = ?, updated_at = ?
+                WHERE user_id = ? AND id IN ({placeholders})
+                """,
+                [status, now_text(), self.user_id, *ids],
+            )
+            conn.commit()
+
+    def refresh_assignment_count_labels(self, assignment_count_label=None, completed_count_label=None):
+        with connect_db() as conn:
+            assignment_count = conn.execute(
+                "SELECT COUNT(*) AS total FROM assignment_tasks WHERE user_id = ? AND status != ?",
+                (self.user_id, ASSIGNMENT_COMPLETED_STATUS),
+            ).fetchone()["total"]
+            completed_count = conn.execute(
+                "SELECT COUNT(*) AS total FROM assignment_tasks WHERE user_id = ? AND status = ?",
+                (self.user_id, ASSIGNMENT_COMPLETED_STATUS),
+            ).fetchone()["total"]
+        if assignment_count_label is not None:
+            assignment_count_label.configure(text=f"⟳  共 {assignment_count} 条任务")
+        if completed_count_label is not None:
+            completed_count_label.configure(text=f"✓  共 {completed_count} 条已完成")
 
     def delete_selected_assignments(self, tree, window):
         selected = self.selected_task_ids(tree)
