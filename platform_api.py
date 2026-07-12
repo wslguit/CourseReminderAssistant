@@ -7,6 +7,8 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 
+from time_utils import parse_datetime
+
 
 SUPPORTED_PLATFORMS = ["学习通", "中国大学 MOOC", "智慧树"]
 ASSIGNMENT_PLATFORMS = ["学校作业平台"]
@@ -1088,24 +1090,12 @@ def _first_time(item, keys):
         .replace("/", "-")
         .strip()
     )
-    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"]:
-        try:
-            parsed = datetime.strptime(cleaned, fmt)
-            return parsed.strftime("%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            continue
-    return None
+    parsed = parse_datetime(cleaned)
+    return parsed.strftime("%Y-%m-%d %H:%M:%S") if parsed else None
 
 
 def _datetime_from_text(value):
-    if not value:
-        return None
-    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"]:
-        try:
-            return datetime.strptime(str(value), fmt)
-        except ValueError:
-            continue
-    return None
+    return parse_datetime(value)
 
 
 def _build_platform_url(platform_name, item):

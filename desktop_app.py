@@ -19,6 +19,7 @@ from platform_api import (
     supported_assignment_platforms,
     supported_platforms,
 )
+from time_utils import parse_datetime
 
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -86,6 +87,7 @@ def now_text():
 
 def connect_db():
     conn = sqlite3.connect(DATABASE)
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -177,15 +179,7 @@ def get_desktop_user_id():
         return cursor.lastrowid
 
 
-def parse_time(value):
-    if not value:
-        return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(value.strip(), fmt)
-        except ValueError:
-            continue
-    return None
+parse_time = parse_datetime
 
 
 def get_setting(user_id, key, default=""):

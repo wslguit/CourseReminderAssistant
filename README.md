@@ -121,7 +121,7 @@ python run_desktop.py
 学校作业平台当前可用的通知接口示例：
 
 - 请求方式：`GET`
-- 作业通知接口 URL：`https://v.guet.edu.cn/.../ntf/users/115611/notifications?...&limit=5&additionalFields=total_count&removed=only_mobile`
+- 作业通知接口 URL：从浏览器开发者工具复制当前账号的完整通知接口，不要把其中的用户标识分享给他人
 - Cookie：从该请求的 Request Headers 里复制
 - Referer：从该请求的 Request Headers 里复制
 
@@ -130,6 +130,7 @@ python run_desktop.py
 ## 网页原型
 
 项目里仍保留原来的 Flask 网页原型，方便展示网页端登录、绑定、课程筛选、批量清除等功能。
+网页版是独立演示原型，使用项目目录下的 `data.sqlite3`；桌面版使用 Windows AppData 下的数据库。两者数据不共享，不应同时当作同一份正式数据使用。
 
 ```bash
 python run_server.py

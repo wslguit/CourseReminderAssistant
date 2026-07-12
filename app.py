@@ -1,4 +1,5 @@
 from datetime import datetime
+import json
 import os
 import sqlite3
 from functools import wraps
@@ -19,11 +20,11 @@ from database_schema import ensure_courses_schema, fallback_course_external_id
 
 from platform_api import (
     ScraperError,
-    crawl_course_details,
     crawl_platform_courses,
     platform_login_url,
     supported_platforms,
 )
+from time_utils import format_datetime, parse_datetime
 
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -37,6 +38,7 @@ app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DATABASE)
+        g.db.execute("PRAGMA foreign_keys = ON")
         g.db.row_factory = sqlite3.Row
     return g.db
 
@@ -71,6 +73,16 @@ def init_db():
             updated_at TEXT NOT NULL,
             UNIQUE(user_id, platform_name),
             FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS fetched_course_cache (
+            user_id INTEGER NOT NULL,
+            platform_name TEXT NOT NULL,
+            external_id TEXT NOT NULL,
+            course_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(user_id, platform_name, external_id),
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         );
 
         """
@@ -120,12 +132,6 @@ def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def parse_dt(value):
-    if not value:
-        return None
-    return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-
-
 def course_status(progress):
     if progress >= 100:
         return "已完成"
@@ -153,8 +159,8 @@ def build_reminders(courses):
     for course in courses:
         if course["status"] in {"已完成", "已结束"}:
             continue
-        deadline = parse_dt(course["deadline_time"])
-        exam = parse_dt(course["exam_time"])
+        deadline = parse_datetime(course["deadline_time"])
+        exam = parse_datetime(course["exam_time"])
         if deadline:
             hours = (deadline - now).total_seconds() / 3600
             if hours < 0 and course["status"] not in {"已完成", "已结束"}:
@@ -441,8 +447,27 @@ def fetch_courses(platform_name):
         flash("没有识别到课程。请确认填写的是课程列表接口，并且 Cookie 仍然有效。", "error")
         return redirect(url_for("platforms"))
 
-    session[f"fetched_courses:{platform_name}"] = fetched
-    get_db().execute(
+    db = get_db()
+    db.execute(
+        "DELETE FROM fetched_course_cache WHERE user_id = ? AND platform_name = ?",
+        (g.user["id"], platform_name),
+    )
+    for item in fetched:
+        db.execute(
+            """
+            INSERT INTO fetched_course_cache
+                (user_id, platform_name, external_id, course_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                g.user["id"],
+                platform_name,
+                item["external_id"],
+                json.dumps(item, ensure_ascii=False),
+                now_text(),
+            ),
+        )
+    db.execute(
         """
         UPDATE platform_accounts
         SET status = '已获取课程', updated_at = ?
@@ -450,7 +475,7 @@ def fetch_courses(platform_name):
         """,
         (now_text(), g.user["id"], platform_name),
     )
-    get_db().commit()
+    db.commit()
     return render_template(
         "select_courses.html",
         platform_name=platform_name,
@@ -462,7 +487,15 @@ def fetch_courses(platform_name):
 @app.route("/sync/<platform_name>", methods=("POST",))
 @login_required
 def sync_platform(platform_name):
-    fetched = session.get(f"fetched_courses:{platform_name}", [])
+    cache_rows = get_db().execute(
+        """
+        SELECT course_json FROM fetched_course_cache
+        WHERE user_id = ? AND platform_name = ?
+        ORDER BY rowid
+        """,
+        (g.user["id"], platform_name),
+    ).fetchall()
+    fetched = [json.loads(row["course_json"]) for row in cache_rows]
     selected_ids = set(request.form.getlist("course_id"))
     if not fetched:
         flash("请先获取课程列表。", "error")
@@ -479,18 +512,6 @@ def sync_platform(platform_name):
     db = get_db()
     imported_count = 0
     selected_courses = [item for item in fetched if item["external_id"] in selected_ids]
-    try:
-        account = get_db().execute(
-            "SELECT * FROM platform_accounts WHERE user_id = ? AND platform_name = ?",
-            (g.user["id"], platform_name),
-        ).fetchone()
-        selected_courses = crawl_course_details(platform_name, account, selected_courses)
-    except ScraperError as exc:
-        flash(str(exc), "error")
-        return redirect(url_for("platforms"))
-    except Exception as exc:
-        flash(f"课程详情读取失败，已导入课程列表基础信息：{exc}", "error")
-
     for item in selected_courses:
         db.execute(
             """
@@ -535,8 +556,11 @@ def sync_platform(platform_name):
         """,
         (now_text(), now_text(), g.user["id"], platform_name),
     )
+    db.execute(
+        "DELETE FROM fetched_course_cache WHERE user_id = ? AND platform_name = ?",
+        (g.user["id"], platform_name),
+    )
     db.commit()
-    session.pop(f"fetched_courses:{platform_name}", None)
     flash(f"已从 {platform_name} 导入 {imported_count} 门课程。", "success")
     return redirect(url_for("courses", platform=platform_name))
 
@@ -570,9 +594,7 @@ def course_detail(course_id):
 
 @app.template_filter("date_short")
 def date_short(value):
-    if not value:
-        return "暂无"
-    return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").strftime("%m-%d %H:%M")
+    return format_datetime(value)
 
 
 if __name__ == "__main__":
