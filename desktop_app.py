@@ -1818,7 +1818,7 @@ class MiniReminderApp:
             rows = conn.execute(
                 """
                 SELECT * FROM courses
-                WHERE user_id = ?
+                WHERE user_id = ? AND status NOT IN ('已完成', '已结束')
                 ORDER BY updated_at DESC
                 """,
                 (self.user_id,),
@@ -2241,16 +2241,16 @@ class MiniReminderApp:
             course_rows = conn.execute(
                 """
                 SELECT * FROM courses
-                WHERE user_id = ?
+                WHERE user_id = ? AND status NOT IN ('已完成', '已结束')
                 """,
                 (self.user_id,),
             ).fetchall()
             assignment_rows = conn.execute(
                 """
                 SELECT * FROM assignment_tasks
-                WHERE user_id = ?
+                WHERE user_id = ? AND status != ?
                 """,
-                (self.user_id,),
+                (self.user_id, ASSIGNMENT_COMPLETED_STATUS),
             ).fetchall()
 
         courses = []

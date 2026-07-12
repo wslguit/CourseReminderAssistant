@@ -113,7 +113,7 @@ def test_desktop_reminders_skip_completed_items(tmp_path, monkeypatch):
     assert app.build_reminders() == []
 
 
-def test_ai_learning_data_preserves_terminal_statuses(tmp_path, monkeypatch):
+def test_ai_learning_data_excludes_terminal_statuses(tmp_path, monkeypatch):
     monkeypatch.setattr(desktop_app, "DATABASE", str(tmp_path / "ai.sqlite3"))
     desktop_app.init_db()
     app = desktop_app.MiniReminderApp.__new__(desktop_app.MiniReminderApp)
@@ -132,6 +132,14 @@ def test_ai_learning_data_preserves_terminal_statuses(tmp_path, monkeypatch):
         )
         conn.execute(
             """
+            INSERT INTO courses
+                (user_id, platform_name, external_id, course_name, status, created_at, updated_at)
+            VALUES (?, '学习通', 'active-course', '进行中课程', '进行中', ?, ?)
+            """,
+            (app.user_id, now, now),
+        )
+        conn.execute(
+            """
             INSERT INTO assignment_tasks
                 (user_id, platform_name, task_type, course_name, task_title,
                  status, external_id, created_at, updated_at)
@@ -139,8 +147,17 @@ def test_ai_learning_data_preserves_terminal_statuses(tmp_path, monkeypatch):
             """,
             (app.user_id, now, now),
         )
+        conn.execute(
+            """
+            INSERT INTO assignment_tasks
+                (user_id, platform_name, task_type, course_name, task_title,
+                 status, external_id, created_at, updated_at)
+            VALUES (?, '学校作业平台', '作业', '测试课程', '进行中任务', '进行中', 'active-task', ?, ?)
+            """,
+            (app.user_id, now, now),
+        )
         conn.commit()
 
     courses, assignments = app.load_ai_learning_data()
-    assert courses[0]["status"] == "已结束"
-    assert assignments[0]["status"] == "已完成"
+    assert [course["course_name"] for course in courses] == ["进行中课程"]
+    assert [assignment["task_title"] for assignment in assignments] == ["进行中任务"]
